@@ -1,0 +1,34 @@
+{
+  "name": "dsh-whale-pet",
+  "version": "1.0.0",
+  "private": true,
+  "description": "An animated DeepSeek blue-whale pet that shows Harness working status, chimes when work completes, and opens a panel listing every interaction.",
+  "type": "module",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "LICENSE",
+    "README.md",
+    "assets/*",
+    "locale/*.json"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}

@@ -1,0 +1,2070 @@
+/**
+ * Browser half of the whale pet.
+ *
+ * Rendering surface: `shell.overlay` — the frame-wide floating layer. That slot
+ * is declared with `kind: 'list'`, `scope: 'root'` and passes the root standard
+ * kit, so this component receives `useSessions` / `useSessionStatus` selector
+ * hooks and can observe every session's running state without any DOM work.
+ *
+ * Three responsibilities:
+ *  1. Draw the DeepSeek whale (the official silhouette path) with a working
+ *     animation that reacts to whether Harness is busy.
+ *  2. Chime once when a unit of work finishes, and subtly when one starts.
+ *  3. Keep a local interaction ledger and show it in a panel opened by click.
+ *
+ * The ledger prefers the Host half's `/pet-whale/state` records, which carry the
+ * real prompt text, reply excerpt, tool count, turns and errors. When that
+ * endpoint is unreachable the pet degrades to a client-derived ledger built from
+ * session running-state transitions, so the panel is never empty.
+ *
+ * No Harness Client package is imported as a module: React, ReactDOM and
+ * React.createElement come from the browser module table.
+ */
+
+window.__ModuleLoader__.load({
+  id: 'dsh-whale-pet',
+  factory(require) {
+    const React = require('react');
+    const h = React.createElement;
+    const { useState, useEffect, useRef, useMemo, useCallback } = React;
+
+    /* ------------------------------------------------------------------ *
+     * Constants
+     * ------------------------------------------------------------------ */
+
+    const ENDPOINT = '/pet-whale/state';
+    const POLL_MS = 1500;
+    const REQUEST_TIMEOUT_MS = 4000;
+    const LOCAL_RECORD_LIMIT = 120;
+    const STORAGE_KEY = 'dsh.pet.whale.records.v1';
+    const PREFIX = 'dsh-pet-whale';
+
+    /** The official DeepSeek whale silhouette, as shipped in the Harness brand mark. */
+    const WHALE_PATH =
+      "M22.9168 1.43018C22.6713 1.31018 22.5658 1.53918 22.4223 1.65519C22.3733 1.69269 22.3318 1.74169 22.2903 1.78669C21.9317 2.1697 21.5127 2.42121 20.9657 2.39121C20.1657 2.34621 19.4827 2.59771 18.8787 3.20973C18.7502 2.45521 18.3236 2.0047 17.6746 1.71569C17.3351 1.56568 16.9916 1.41518 16.7536 1.08867C16.5876 0.856163 16.5421 0.597155 16.4591 0.341647C16.4061 0.187643 16.3536 0.0301382 16.1761 0.00363739C15.9836 -0.0263635 15.9081 0.135141 15.8326 0.270145C15.5306 0.822162 15.4136 1.43018 15.4251 2.0462C15.4516 3.43174 16.0366 4.53527 17.1991 5.3203C17.3311 5.4103 17.3651 5.5003 17.3236 5.63181C17.2441 5.90231 17.1501 6.16482 17.0671 6.43533C17.0141 6.60784 16.9351 6.64584 16.7501 6.57033C16.1121 6.30383 15.5611 5.90931 15.074 5.4328C14.2475 4.63328 13.5 3.75075 12.568 3.05973C12.349 2.89822 12.13 2.74822 11.9034 2.60522C10.9524 1.68169 12.028 0.923165 12.277 0.833162C12.5375 0.739159 12.3675 0.41615 11.5259 0.42015C10.6844 0.42365 9.91439 0.705658 8.93286 1.08117C8.78935 1.13767 8.63835 1.17867 8.48384 1.21267C7.59332 1.04367 6.66829 1.00617 5.70226 1.11517C3.88321 1.31768 2.43016 2.1777 1.36213 3.64575C0.0790928 5.4103 -0.222916 7.41536 0.146595 9.50642C0.535106 11.7105 1.66014 13.535 3.38869 14.9616C5.18125 16.4406 7.24581 17.1657 9.60138 17.0266C11.0319 16.9441 12.6245 16.7526 14.421 15.2321C14.874 15.4576 15.3496 15.5476 16.1381 15.6151C16.7456 15.6716 17.3306 15.5851 17.7836 15.4911C18.4931 15.3411 18.4441 14.6841 18.1876 14.5636C16.1081 13.595 16.5646 13.9891 16.1496 13.67C17.2061 12.42 18.8202 10.1979 19.3182 7.17235C19.3672 6.83834 19.4297 6.36783 19.4222 6.09732C19.4182 5.93231 19.4562 5.86831 19.6447 5.84931C20.1657 5.78931 20.6712 5.64681 21.1357 5.3913C22.4833 4.65528 23.0268 3.44624 23.1548 1.9972C23.1738 1.77569 23.1508 1.54668 22.9168 1.43018ZM11.1749 14.4736C9.15936 12.889 8.18184 12.3675 7.77832 12.39C7.40081 12.4125 7.46881 12.8445 7.55182 13.126C7.63882 13.404 7.75182 13.5955 7.91033 13.8396C8.01983 14.0011 8.09533 14.2411 7.80083 14.4216C7.15181 14.8231 6.02327 14.2866 5.97027 14.2601C4.65673 13.4865 3.5587 12.4655 2.78467 11.069C2.03715 9.72493 1.60314 8.28289 1.53164 6.74384C1.51264 6.37233 1.62214 6.24082 1.99215 6.17332C2.47916 6.08332 2.98118 6.06432 3.46769 6.13582C5.52476 6.43633 7.27581 7.35586 8.74385 8.8129C9.58188 9.64243 10.2159 10.634 10.8689 11.6025C11.5634 12.631 12.3105 13.611 13.262 14.4146C13.598 14.6961 13.866 14.9101 14.1225 15.0681C13.349 15.1546 12.058 15.1731 11.1749 14.4746L11.1749 14.4736ZM12.141 8.25988C12.141 8.09488 12.273 7.96338 12.439 7.96338C12.4765 7.96338 12.5105 7.97088 12.541 7.98188C12.5825 7.99688 12.6205 8.01938 12.6505 8.05338C12.7035 8.10588 12.7335 8.18088 12.7335 8.25988C12.7335 8.42489 12.6015 8.55639 12.4355 8.55639C12.2695 8.55639 12.141 8.42489 12.141 8.25988ZM15.1415 9.79893C14.949 9.87793 14.7565 9.94544 14.5715 9.95294C14.2845 9.96794 13.9715 9.85143 13.8015 9.70893C13.5375 9.48742 13.3485 9.36342 13.2695 8.97691C13.2355 8.8119 13.2545 8.55639 13.2845 8.40989C13.3525 8.09438 13.277 7.89187 13.0545 7.70787C12.8735 7.55786 12.643 7.51636 12.39 7.51636C12.2955 7.51636 12.209 7.47486 12.1445 7.44136C12.039 7.38886 11.9519 7.25735 12.035 7.09585C12.0615 7.04335 12.19 6.91584 12.22 6.89334C12.5635 6.69784 12.9595 6.76184 13.326 6.90834C13.6655 7.04735 13.9225 7.30236 14.292 7.66287C14.6695 8.09838 14.7375 8.21838 14.9525 8.54539C15.1225 8.8009 15.277 9.06341 15.3831 9.36392C15.4471 9.55142 15.3641 9.70493 15.1415 9.79893Z";
+
+    /* ------------------------------------------------------------------ *
+     * Cost accounting
+     * ------------------------------------------------------------------ */
+
+    /**
+     * Per-1M-token rates, from the published DeepSeek price tables:
+     * CNY — https://api-docs.deepseek.com/zh-cn/quick_start/pricing/
+     * USD — https://api-docs.deepseek.com/quick_start/pricing/
+     *
+     * Both are carried because the domestic platform bills in CNY while the
+     * international page quotes USD, and the two are not a plain conversion of
+     * each other. The user picks; CNY is the default.
+     *
+     * Off-peak is exactly half of peak in both currencies.
+     *
+     * `cacheWriteTokens` deliberately has no rate of its own — DeepSeek reports
+     * it but bills it as a cache miss, i.e. at the full input rate.
+     */
+    const RATE_TABLES = {
+      CNY: {
+        symbol: '¥',
+        label: '人民币 CNY',
+        models: {
+          'deepseek-flash': {
+            label: 'deepseek-flash',
+            peak: { hit: 0.04, miss: 2, output: 8 },
+            offPeak: { hit: 0.02, miss: 1, output: 4 },
+          },
+          'deepseek-v4-pro': {
+            label: 'deepseek-v4-pro',
+            peak: { hit: 0.3, miss: 9, output: 27 },
+            offPeak: { hit: 0.15, miss: 4.5, output: 13.5 },
+          },
+        },
+      },
+      USD: {
+        symbol: '$',
+        label: '美元 USD',
+        models: {
+          'deepseek-flash': {
+            label: 'deepseek-flash',
+            peak: { hit: 0.006, miss: 0.3, output: 1.2 },
+            offPeak: { hit: 0.003, miss: 0.15, output: 0.6 },
+          },
+          'deepseek-v4-pro': {
+            label: 'deepseek-v4-pro',
+            peak: { hit: 0.044, miss: 1.32, output: 3.96 },
+            offPeak: { hit: 0.022, miss: 0.66, output: 1.98 },
+          },
+        },
+      },
+    };
+    /** Default billing currency: the domestic platform bills in CNY. */
+    const DEFAULT_CURRENCY = 'CNY';
+    /** Chosen model, overridable in localStorage. */
+    const RATE_MODEL_KEY = `${STORAGE_KEY}.rateModel`;
+    /** Chosen currency, overridable in localStorage. */
+    const RATE_CURRENCY_KEY = `${STORAGE_KEY}.rateCurrency`;
+    /** Whole-table override, as JSON, for when the published prices move. */
+    const RATE_OVERRIDE_KEY = `${STORAGE_KEY}.rates`;
+    /**
+     * Peak windows in UTC hours [start, end), Monday to Friday. The Chinese page
+     * states them as Beijing time 09:00–12:00 and 14:00–18:00 on weekdays, which
+     * is exactly UTC 01:00–04:00 and 06:00–10:00, since Beijing is UTC+8. Both
+     * pages therefore describe the same windows.
+     */
+    const PEAK_WINDOWS = [[1, 4], [6, 10]];
+
+    /**
+     * Whether a moment falls in a peak-pricing window.
+     *
+     * @param date - the instant to test.
+     * @returns true when peak rates apply.
+     */
+    function isPeak(date) {
+      const day = date.getUTCDay();
+      if (day === 0 || day === 6) return false;
+      const hour = date.getUTCHours();
+      return PEAK_WINDOWS.some(([start, end]) => hour >= start && hour < end);
+    }
+
+    /**
+     * Resolve the active rate table, model and currency.
+     *
+     * Every read is guarded: a corrupt override or an unavailable store leaves
+     * the built-in tables in force rather than breaking the panel.
+     *
+     * @returns `{ table, models, currency, symbol, model }`.
+     */
+    function readRates() {
+      const tables = { ...RATE_TABLES };
+      try {
+        const raw = window.localStorage.getItem(RATE_OVERRIDE_KEY);
+        if (raw !== null) {
+          const parsed = JSON.parse(raw);
+          // An override may replace one currency's table or add a new one; it
+          // must not be able to delete the built-ins.
+          if (parsed !== null && typeof parsed === 'object') {
+            for (const [key, value] of Object.entries(parsed)) {
+              if (value !== null && typeof value === 'object' && value.models !== undefined) tables[key] = value;
+            }
+          }
+        }
+      } catch {
+        /* keep the built-in tables */
+      }
+      let currency = tables[DEFAULT_CURRENCY] === undefined ? Object.keys(tables)[0] : DEFAULT_CURRENCY;
+      try {
+        const chosen = window.localStorage.getItem(RATE_CURRENCY_KEY);
+        if (typeof chosen === 'string' && tables[chosen] !== undefined) currency = chosen;
+      } catch {
+        /* keep the default currency */
+      }
+      const table = tables[currency];
+      const models = table.models;
+      let model = Object.keys(models)[0];
+      try {
+        const chosen = window.localStorage.getItem(RATE_MODEL_KEY);
+        if (typeof chosen === 'string' && models[chosen] !== undefined) model = chosen;
+      } catch {
+        /* keep the default model */
+      }
+      return { table, models, currency, symbol: table.symbol, model };
+    }
+
+    /** Every selectable currency, for the panel's selector. */
+    function currencyOptions() {
+      return Object.entries(RATE_TABLES).map(([key, value]) => ({ key, label: value.label }));
+    }
+
+    /** Sum every billable bucket of one bucket set, matching the Host's rule. */
+    function tokensTotal(tokens) {
+      if (tokens === null || typeof tokens !== 'object') return 0;
+      return (tokens.inputTokens ?? 0) + (tokens.outputTokens ?? 0) + (tokens.cacheReadTokens ?? 0) + (tokens.cacheWriteTokens ?? 0);
+    }
+
+    /**
+     * Read the browser-side `tokenUsage` projection for one session.
+     *
+     * This is the fallback that keeps the accounting block useful when the Host
+     * half is stale or absent. Session projections are registered on the Client
+     * too — `dsh-token-meter` documents `tokenUsage` as carrying the durable
+     * log's `uncachedInputTokens`, `outputTokens`, `cacheReadTokens` and
+     * `cacheWriteTokens` — so the same billed breakdown is reachable without any
+     * Host round trip.
+     *
+     * The documented shape is `SessionBinding.session.projections: ProjectionsFace`,
+     * whose only declared method is `faceOf(key): ObservableSnapshot<unknown>`,
+     * so the value is read with `getSnapshot()`. A bare `get(key)` is also tried
+     * because the underlying store has one; neither is assumed.
+     *
+     * Every hop is optional and the whole read is guarded: the service shape is
+     * not part of this plugin's contract, and a missing piece must degrade to
+     * "no data" rather than break the panel.
+     *
+     * @param sessions - the `sessions` Client service, if the composition has one.
+     * @param sessionId - the session to read.
+     * @returns a bucket set, or undefined when the projection is unavailable.
+     */
+    function readClientTokens(sessions, sessionId) {
+      if (sessions === undefined || sessions === null || typeof sessionId !== 'string') return undefined;
+      try {
+        if (typeof sessions.binding !== 'function') return undefined;
+        const projections = sessions.binding(sessionId)?.session?.projections;
+        if (projections === null || typeof projections !== 'object') return undefined;
+
+        let projection;
+        if (typeof projections.faceOf === 'function') {
+          projection = projections.faceOf('tokenUsage')?.getSnapshot?.();
+        }
+        if (projection === undefined && typeof projections.get === 'function') {
+          projection = projections.get('tokenUsage');
+        }
+        if (projection === null || typeof projection !== 'object') return undefined;
+
+        // `uncachedInputTokens` is this projection's name for the cache-miss bucket.
+        const tokens = {
+          inputTokens: projection.uncachedInputTokens ?? 0,
+          outputTokens: projection.outputTokens ?? 0,
+          cacheReadTokens: projection.cacheReadTokens ?? 0,
+          cacheWriteTokens: projection.cacheWriteTokens ?? 0,
+          reasoningTokens: 0,
+          requests: 0,
+        };
+        return tokensTotal(tokens) > 0 ? tokens : undefined;
+      } catch {
+        return undefined;
+      }
+    }
+
+    /**
+     * Ask the Client to load one session's projections.
+     *
+     * `sessions.refreshProjections(sessionId)` "loads all Session projections
+     * once per connection", so a reader that only borrowed a binding may still
+     * see an empty projection until this runs. Fire-and-forget: a failure just
+     * means the accounting stays on whatever the Host reported.
+     *
+     * @param sessions - the `sessions` Client service.
+     * @param sessionId - the session to load.
+     */
+    function refreshClientTokens(sessions, sessionId) {
+      if (sessions === undefined || sessions === null || typeof sessionId !== 'string') return;
+      try {
+        if (typeof sessions.refreshProjections !== 'function') return;
+        const pending = sessions.refreshProjections(sessionId);
+        if (pending !== null && typeof pending?.catch === 'function') pending.catch(() => {});
+      } catch {
+        /* the projection simply stays unavailable */
+      }
+    }
+
+    /**
+     * Price one bucket set.
+     *
+     * Returns every component separately so the panel can show where the money
+     * went rather than only a total, plus `missTokens`, the bucket that actually
+     * carries the full input rate.
+     *
+     * @param tokens - a bucket set from the Host snapshot.
+     * @param rate - `{ hit, miss, output }` for the selected model and window.
+     * @returns the component costs and their total, in USD.
+     */
+    function priceTokens(tokens, rate) {
+      // The snapshot may arrive without a session row at all (a fresh load, or a
+      // Host half that has not reported usage yet), so a missing shape must read
+      // as zero rather than throw during render.
+      const buckets = tokens !== null && typeof tokens === 'object' ? tokens : {};
+      const per = (value) => (typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0) / 1_000_000;
+      const missTokens = per(buckets.inputTokens) + per(buckets.cacheWriteTokens);
+      const cacheHitCost = per(buckets.cacheReadTokens) * rate.hit;
+      const inputCost = missTokens * rate.miss;
+      const outputCost = per(buckets.outputTokens) * rate.output;
+      return {
+        cacheHitCost,
+        inputCost,
+        outputCost,
+        total: cacheHitCost + inputCost + outputCost,
+      };
+    }
+
+    /** Group digits for readability: `1234567` → `1,234,567`. */
+    function count(value) {
+      const number = typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : 0;
+      return number.toLocaleString('en-US');
+    }
+
+    /**
+     * Format a money amount, keeping small charges legible.
+     *
+     * Sub-cent totals would round to `¥0.00`, which tells the user nothing, so
+     * anything under a unit is shown fractionally instead. `$0.00393` is a real
+     * charge; `$0.00` is not information.
+     *
+     * @param value - the amount.
+     * @param symbol - the currency symbol to prefix.
+     */
+    function money(value, symbol = '¥') {
+      const amount = typeof value === 'number' && Number.isFinite(value) ? value : 0;
+      if (amount === 0) return `${symbol}0.00`;
+      if (amount < 0.01) return `${symbol}${amount.toFixed(5)}`;
+      if (amount < 1) return `${symbol}${amount.toFixed(4)}`;
+      return `${symbol}${amount.toFixed(2)}`;
+    }
+
+    /**
+     * Resolve "is Harness working right now" from the two observers.
+     *
+     * This is the rule that has been wrong twice, in opposite directions, so it
+     * is a pure function with a test rather than an inline expression:
+     *
+     * - Preferring the Host hid work the Client could plainly see, because a
+     *   stale Host reported `ok: true` with an empty ledger.
+     * - A plain union then let one stuck Host claim freeze the pet on "working"
+     *   forever after the turn ended.
+     *
+     * The Client's session-status view is live and self-correcting, so it wins
+     * whenever it is loaded. The Host is believed only while the Client has no
+     * view at all, which is the one case where going blind would be worse.
+     *
+     * @param input - `{ clientKnows, clientBusy, hostBusy }`.
+     * @returns `{ busy, disagrees }`, where `disagrees` means the Host still
+     *   claims work the Client cannot see.
+     */
+    function resolveBusy({ clientKnows, clientBusy, hostBusy }) {
+      const hostClaimsBusy = hostBusy === true;
+      return {
+        busy: clientKnows ? clientBusy === true : hostClaimsBusy,
+        disagrees: clientKnows === true && hostClaimsBusy && clientBusy !== true,
+      };
+    }
+
+    /**
+     * Format one wallet balance, choosing the symbol by its OWN currency.
+     *
+     * The Platform reports the amount as a string in the wallet's currency, so
+     * the symbol must come from the wallet rather than from the selected rate
+     * table — the two can legitimately differ.
+     *
+     * @param wallet - `{ currency, balance }`.
+     * @returns display text.
+     */
+    function walletText(wallet) {
+      const symbol = wallet.currency === 'CNY' ? '¥' : wallet.currency === 'USD' ? '$' : `${wallet.currency} `;
+      const amount = Number(wallet.balance);
+      if (!Number.isFinite(amount)) return `${symbol}${wallet.balance}`;
+      return `${symbol}${amount.toFixed(2)}`;
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Small helpers
+     * ------------------------------------------------------------------ */
+
+    /** Two-digit clock time for one epoch millisecond value. */
+    function clockTime(value) {
+      const date = new Date(value);
+      return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}:${String(date.getSeconds()).padStart(2, '0')}`;
+    }
+
+    /** Elapsed time as `1m 04s`, `12s` or `820ms`. */
+    function duration(value) {
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return '—';
+      if (value < 1000) return `${Math.round(value)}ms`;
+      const seconds = Math.round(value / 1000);
+      if (seconds < 60) return `${seconds}s`;
+      const minutes = Math.floor(seconds / 60);
+      return `${minutes}m ${String(seconds % 60).padStart(2, '0')}s`;
+    }
+
+    /** Length of a string in whole code points, so CJK is not over-counted. */
+    function glyphs(value) {
+      return typeof value === 'string' ? [...value].length : 0;
+    }
+
+    /** Keep one session id usable as a short label when nothing better exists. */
+    function shortId(value) {
+      if (typeof value !== 'string') return '';
+      return value.length > 18 ? `${value.slice(0, 16)}…` : value;
+    }
+
+    /**
+     * Choose the ledger to display. The Host half's records are authoritative —
+     * they carry prompt text, reply excerpts, tool counts and errors — so they
+     * replace the client-derived ledger entirely while the endpoint answers.
+     * The local ledger is the offline fallback, not a second source, because
+     * the two observe the same episodes and would otherwise duplicate rows.
+     */
+    function selectRecords(hostOk, hostRecords, localRecords) {
+      if (hostOk && hostRecords.length > 0) {
+        return hostRecords.map((record) => ({ ...record, origin: 'host' }));
+      }
+      return localRecords
+        .map((record) => ({ ...record, origin: 'local' }))
+        .sort((left, right) => (right.endedAt ?? 0) - (left.endedAt ?? 0));
+    }
+
+    /** Read the persisted local ledger, tolerating absent or corrupt storage. */
+    function readStored() {
+      try {
+        const raw = window.localStorage.getItem(STORAGE_KEY);
+        if (raw === null) return [];
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return [];
+        return parsed.filter((item) => item !== null && typeof item === 'object');
+      } catch {
+        return [];
+      }
+    }
+
+    /** Persist the local ledger; a quota or privacy failure must not break the pet. */
+    function writeStored(records) {
+      try {
+        window.localStorage.setItem(STORAGE_KEY, JSON.stringify(records.slice(0, LOCAL_RECORD_LIMIT)));
+      } catch {
+        /* storage unavailable: the ledger stays in memory for this page */
+      }
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Chime: Web Audio, no assets
+     * ------------------------------------------------------------------ */
+
+    /* ------------------------------------------------------------------ *
+     * Chime: a small synthesized bell, no assets
+     * ------------------------------------------------------------------ */
+
+    /** One octave up, the shimmer partial every voice carries. */
+    const OCTAVE = 2;
+    /** Per-voice peak. Sized against `CHIME_MASTER` so the summed peak is ~0.92. */
+    const VOICE_GAIN = 0.34;
+    /**
+     * Output trim.
+     *
+     * Deliberately above 1: a short, shaped bell has plenty of headroom, and the
+     * limiter after it catches the peak. The first revision sat at 0.10 per voice
+     * with no output stage at all, and the second was still reported as hard to
+     * hear, so this is the loud end of comfortable rather than a cautious middle.
+     */
+    const CHIME_MASTER = 2.6;
+    /** Note attacks, far enough apart that each partial is heard on its own. */
+    const NOTE_GAP = 0.105;
+
+    /**
+     * Schedule one bell voice into any AudioContext-shaped object.
+     *
+     * Pure and synchronous, so `tools/chime-test.mjs` can drive it with a stub
+     * context and assert the schedule and the loudness budget without a browser.
+     *
+     * The shape matters for "clear": a 6 ms linear attack avoids the click a
+     * hard start makes, and an exponential decay to a near-zero floor is what
+     * makes a bell read as a bell. A gain of exactly 0 is illegal for
+     * `exponentialRampToValueAtTime`, hence the floor rather than 0.
+     *
+     * @param context - AudioContext, OfflineAudioContext, or a stub.
+     * @param options - `{ at, frequency, duration, gain, type, attack, octave, shimmer }`,
+     *   where the last three come from the selected tone's voicing.
+     */
+    function renderVoice(context, { at, frequency, duration, gain, type, attack = 0.006, octave = OCTAVE, shimmer = 0.2 }) {
+      const envelope = context.createGain();
+      envelope.gain.setValueAtTime(0.0001, at);
+      envelope.gain.linearRampToValueAtTime(gain, at + attack);
+      envelope.gain.exponentialRampToValueAtTime(0.0001, at + duration);
+      // A second, quieter partial above the fundamental. This is what makes the
+      // tone bright and "present" instead of the dull thud a lone sine gives; the
+      // interval and level are the tone's voicing.
+      const body = context.createOscillator();
+      body.type = type;
+      body.frequency.setValueAtTime(frequency, at);
+      const shimmerOsc = context.createOscillator();
+      shimmerOsc.type = 'sine';
+      shimmerOsc.frequency.setValueAtTime(frequency * octave, at);
+      const shimmerGain = context.createGain();
+      shimmerGain.gain.setValueAtTime(gain * shimmer, at);
+
+      body.connect(envelope);
+      shimmerOsc.connect(shimmerGain);
+      shimmerGain.connect(envelope);
+
+      const stop = at + duration + 0.03;
+      body.start(at);
+      body.stop(stop);
+      shimmerOsc.start(at);
+      shimmerOsc.stop(stop);
+      return envelope;
+    }
+
+    /**
+     * Schedule one note sequence.
+     *
+     * Returns one envelope node PER NOTE rather than a single node, because each
+     * note is its own gain stage. The caller is responsible for connecting them to
+     * an output — a node that is never connected produces nothing at all, with no
+     * error to notice.
+     *
+     * @param context - the target context.
+     * @param notes - `{ frequency, duration, gain?, type? }[]`, played in order.
+     * @param startAt - absolute start time.
+     * @param voicing - the selected tone's timbre: `{ type, octave, shimmer, attack, gain }`.
+     * @returns one envelope node per note, in play order.
+     */
+    function renderChime(context, notes, startAt, voicing = {}) {
+      let cursor = startAt;
+      const sources = [];
+      for (const note of notes) {
+        sources.push(renderVoice(context, {
+          at: cursor,
+          frequency: note.frequency,
+          duration: note.duration,
+          // Per-tone gain scales the shared voice peak, so a quiet tone stays
+          // quiet without every note in it being rewritten.
+          gain: VOICE_GAIN * (note.gain ?? 1) * (voicing.gain ?? 1),
+          type: note.type ?? voicing.type ?? 'triangle',
+          attack: voicing.attack,
+          octave: voicing.octave,
+          shimmer: voicing.shimmer,
+        }));
+        cursor += NOTE_GAP;
+      }
+      return sources;
+    }
+
+    /**
+     * How long a note sequence takes to finish ringing, in seconds.
+     *
+     * The RING-OUT, not the last note's start: a note's duration extends past the
+     * end of the sequence, and a caller wanting to know when the chime is over
+     * would otherwise read a number that is too small.
+     *
+     * @param notes - the note data that was scheduled.
+     * @param startAt - the absolute start time it was scheduled at.
+     * @returns seconds from `startAt` until the last note finishes.
+     */
+    function ringOut(notes, startAt) {
+      let endsAt = startAt;
+      notes.forEach((note, index) => {
+        endsAt = Math.max(endsAt, startAt + index * NOTE_GAP + note.duration);
+      });
+      return endsAt - startAt;
+    }
+
+    /**
+     * Build the output stage: soft lowpass, then a limiter, then the trim.
+     *
+     * @param context - the target context.
+     * @param masterGain - the selected tone's output trim, relative to
+     *   `CHIME_MASTER`; a tone that should sit further back passes less.
+     */
+    function chimeOutput(context, masterGain = CHIME_MASTER) {
+      const master = context.createGain();
+      master.gain.setValueAtTime(masterGain, context.currentTime);
+      const bus = context.createGain();
+      // Two paths, so the compressor reacts to both an open and a soft tone.
+      const softener = context.createBiquadFilter();
+      softener.type = 'lowpass';
+      softener.frequency.setValueAtTime(4200, context.currentTime);
+      bus.connect(master);
+      bus.connect(softener);
+      softener.connect(master);
+      const limiter = context.createDynamicsCompressor();
+      // A high threshold keeps the bell's shape; the knee and ratio only catch
+      // the summed peak, so loudness rises without the tone going squashed.
+      limiter.threshold.setValueAtTime(-8, context.currentTime);
+      limiter.knee.setValueAtTime(10, context.currentTime);
+      limiter.ratio.setValueAtTime(10, context.currentTime);
+      limiter.attack.setValueAtTime(0.003, context.currentTime);
+      limiter.release.setValueAtTime(0.18, context.currentTime);
+      master.connect(limiter);
+      limiter.connect(context.destination);
+      return bus;
+    }
+
+    /**
+     * The selectable completion tones.
+     *
+     * Every entry is the same shape — three events, each a list of notes plus an
+     * optional per-tone voicing — so a new tone is data, not code. The user picks
+     * which one the pet plays; the choice persists, and every tone is audible
+     * from the panel's preview control. Deliberately distinct in character so the
+     * pick is a real choice rather than a variation.
+     */
+    const TONES = {
+      bright: {
+        label: '明亮铃音 Bright（音频文件）',
+        hint: '播放 assets/tone.wav,替换该文件即可换音',
+        source: 'asset',
+        done: [
+          { frequency: 523.25, duration: 0.5 },
+          { frequency: 659.25, duration: 0.5, gain: 0.92 },
+          { frequency: 783.99, duration: 0.62, gain: 0.85 },
+          { frequency: 1046.5, duration: 0.85, gain: 0.6 },
+        ],
+        failed: [
+          { frequency: 622.25, duration: 0.34 },
+          { frequency: 466.16, duration: 0.6, gain: 0.95 },
+          { frequency: 349.23, duration: 0.9, gain: 0.8 },
+        ],
+        start: [{ frequency: 1318.51, duration: 0.1, gain: 0.4 }],
+      },
+      soft: {
+        label: '柔和木琴 Soft',
+        hint: '纯正弦,弱起音,安静',
+        source: 'synth',
+        octave: 1.5,
+        shimmer: 0.1,
+        master: 0.8,
+        done: [
+          { frequency: 587.33, duration: 0.55, gain: 0.8 },
+          { frequency: 880, duration: 0.75, gain: 0.62 },
+        ],
+        failed: [
+          { frequency: 440, duration: 0.5, gain: 0.75 },
+          { frequency: 329.63, duration: 0.85, gain: 0.6 },
+        ],
+        start: [{ frequency: 880, duration: 0.12, gain: 0.35 }],
+      },
+      marimba: {
+        label: '木质马林巴 Marimba',
+        hint: '方形波,短促干脆',
+        source: 'synth',
+        type: 'square',
+        shimmer: 0.12,
+        master: 0.62,
+        done: [
+          { frequency: 523.25, duration: 0.22 },
+          { frequency: 783.99, duration: 0.34, gain: 0.8 },
+        ],
+        failed: [
+          { frequency: 392, duration: 0.3, gain: 0.85 },
+          { frequency: 261.63, duration: 0.45, gain: 0.7 },
+        ],
+        start: [{ frequency: 1046.5, duration: 0.08, gain: 0.4 }],
+      },
+      click: {
+        label: '轻点提示 Click',
+        hint: '单音极简,最不打扰',
+        source: 'synth',
+        type: 'triangle',
+        shimmer: 0.08,
+        master: 0.75,
+        done: [
+          { frequency: 880, duration: 0.18 },
+          { frequency: 1174.66, duration: 0.3, gain: 0.7 },
+        ],
+        failed: [{ frequency: 349.23, duration: 0.35, gain: 0.9 }],
+        start: [{ frequency: 1318.51, duration: 0.06, gain: 0.35 }],
+      },
+      bell: {
+        label: '长尾钟声 Bell',
+        hint: '慢起音,余韵悠长',
+        source: 'synth',
+        type: 'triangle',
+        octave: 2.5,
+        shimmer: 0.28,
+        master: 0.7,
+        attack: 0.035,
+        done: [
+          { frequency: 523.25, duration: 1.1 },
+          { frequency: 783.99, duration: 1.4, gain: 0.55 },
+        ],
+        failed: [{ frequency: 392, duration: 1.2, gain: 0.8 }],
+        start: [{ frequency: 1046.5, duration: 0.14, gain: 0.3 }],
+      },
+    };
+    /** Default tone, used until the user picks another. */
+    const DEFAULT_TONE = 'bright';
+    /** Persisted tone choice. */
+    const TONE_KEY = `${STORAGE_KEY}.tone`;
+
+    /** Read the chosen tone name, tolerating absent or corrupt storage. */
+    function readTone() {
+      try {
+        const stored = window.localStorage.getItem(TONE_KEY);
+        if (typeof stored === 'string' && TONES[stored] !== undefined) return stored;
+      } catch {
+        /* fall through to the default */
+      }
+      return DEFAULT_TONE;
+    }
+
+    /** Where the Host serves this package's tone asset. */
+    const TONE_URL = '/pet-whale/assets/tone.wav';
+
+    /**
+     * Lazily created context plus the cue API.
+     *
+     * Browsers refuse to start audio before a user gesture, so the context is
+     * created on demand and resumed on the first `pointerdown` / `keydown`.
+     * `getState()` is the only reliable signal available for that.
+     *
+     * The cue itself is a file (`assets/tone.wav`) rather than synthesized notes,
+     * so the sound can be replaced without touching code. The WAV form is kept
+     * deliberately: it is the one container every browser decodes without a
+     * license, and it is small once downmixed to 24 kHz mono. Synthesized notes
+     * remain as the fallback, so a missing or undecodable asset still makes a
+     * sound instead of silence.
+     */
+    const audio = {
+      context: undefined,
+      bus: undefined,
+      unavailable: false,
+      /** Decoded tone buffer, or a marker that loading already failed. */
+      buffer: undefined,
+      bufferState: 'idle',
+      /** Create the context and output stage on first use, or record that audio is off. */
+      ensure() {
+        if (this.unavailable) return undefined;
+        if (this.context !== undefined) return this.context;
+        const Ctor = window.AudioContext ?? window.webkitAudioContext;
+        if (typeof Ctor !== 'function') {
+          this.unavailable = true;
+          return undefined;
+        }
+        try {
+          this.context = new Ctor();
+          this.bus = chimeOutput(this.context, (TONES[this.toneName]?.master ?? 1) * CHIME_MASTER);
+        } catch {
+          this.unavailable = true;
+          return undefined;
+        }
+        return this.context;
+      },
+      /** Resume a context the autoplay policy suspended; safe to call repeatedly. */
+      unlock() {
+        const context = this.ensure();
+        if (context !== undefined && context.state === 'suspended') {
+          context.resume().catch(() => {});
+        }
+      },
+      /**
+       * Play one note sequence.
+       *
+       * The autoplay policy is the main reason a correctly built chime can still
+       * be inaudible: a freshly created context starts `suspended` in some
+       * browsers, and scheduling notes into a suspended context plays nothing at
+       * all. So the context is resumed FIRST and the notes are only scheduled
+       * once it reports `running`; the resume is awaited rather than fired and
+       * forgotten, which is what removes that race.
+       *
+       * @param notes - the note data to schedule.
+       * @returns the ring-out in seconds, or undefined when audio is unavailable.
+       */
+      play(notes, voicing) {
+        const context = this.ensure();
+        if (context === undefined) return undefined;
+        const schedule = () => {
+          const start = context.currentTime + 0.02;
+          // Every rendered note must be attached to the output, and a note IS its
+          // own node: `renderChime` returns one envelope per note. Leaving them
+          // unattached is completely silent — no error, no warning, nothing in
+          // the graph — which is how four of the five tones ended up mute while
+          // the asset path (which connects explicitly) still played.
+          const bus = this.bus ?? context.destination;
+          const sources = renderChime(context, notes, start, voicing);
+          if (Array.isArray(sources)) {
+            for (const node of sources) {
+              if (node !== null && typeof node?.connect === 'function') node.connect(bus);
+            }
+          }
+          return ringOut(notes, start);
+        };
+        if (context.state === 'running') return schedule();
+        if (typeof context.resume !== 'function') return undefined;
+        try {
+          const resumed = context.resume();
+          if (resumed !== null && typeof resumed?.then === 'function') {
+            return resumed.then(schedule, () => undefined);
+          }
+        } catch {
+          return undefined;
+        }
+        // No promise to await: schedule anyway rather than dropping the cue.
+        return schedule();
+      },
+      /** The selected tone's note data and voicing. */
+      tone() {
+        return TONES[this.toneName] ?? TONES[DEFAULT_TONE];
+      },
+      toneName: readTone(),
+      /**
+       * Switch the completion tone.
+       *
+       * The output stage is rebuilt because a tone carries its own trim; the old
+       * bus is dropped so the change is immediate rather than additive.
+       */
+      setTone(name) {
+        if (TONES[name] === undefined) return;
+        this.toneName = name;
+        try {
+          window.localStorage.setItem(TONE_KEY, name);
+        } catch {
+          /* the choice simply will not persist */
+        }
+        const context = this.context;
+        if (context === undefined) return;
+        try {
+          this.bus = chimeOutput(context, (TONES[name].master ?? 1) * CHIME_MASTER);
+        } catch {
+          /* keep the existing stage rather than losing audio */
+        }
+      },
+      /**
+       * Load and decode the tone asset, once.
+       *
+       * Fire-and-forget by design: the caller plays synthesized notes while this
+       * is in flight, so the first cue is never delayed by a fetch. A failure is
+       * recorded rather than retried on every cue.
+       */
+      loadTone() {
+        const context = this.ensure();
+        if (context === undefined) return undefined;
+        if (this.bufferState !== 'idle') return undefined;
+        this.bufferState = 'loading';
+        return Promise.resolve()
+          .then(() => fetch(TONE_URL, { credentials: 'same-origin' }))
+          .then((response) => {
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            return response.arrayBuffer();
+          })
+          .then((bytes) => context.decodeAudioData(bytes))
+          .then((decoded) => {
+            this.buffer = decoded;
+            this.bufferState = 'ready';
+            return decoded;
+          })
+          .catch((error) => {
+            this.bufferState = 'failed';
+            console.warn?.(`[${'dsh-pet-whale'}] tone asset unavailable, using the synthesized cue:`, error);
+            return undefined;
+          });
+      },
+      /** Play the decoded asset, if there is one. */
+      playAsset() {
+        const context = this.context;
+        const buffer = this.buffer;
+        if (context === undefined || buffer === undefined) return undefined;
+        const source = context.createBufferSource();
+        source.buffer = buffer;
+        source.connect(this.bus ?? context.destination);
+        source.start();
+        return buffer.duration;
+      },
+      done() {
+        const tone = this.tone();
+        // Route by the tone's declared source. Preferring the asset for every
+        // tone is what made all five choices play one identical cached buffer;
+        // the picker only means something if it changes the sound.
+        if (tone.source === 'asset') {
+          const played = this.playAsset();
+          if (played !== undefined) return played;
+          // Not decoded yet (or unavailable): kick the load and use the notes, so
+          // the first cue is not delayed by a fetch and never goes silent.
+          this.loadTone();
+        }
+        return this.play(tone.done, tone);
+      },
+      failed() {
+        // The asset carries only the success sound, so a failure stays synthesized
+        // and takes the selected tone's downward shape.
+        const tone = this.tone();
+        return this.play(tone.failed, tone);
+      },
+      start() {
+        const tone = this.tone();
+        return this.play(tone.start, tone);
+      },
+    };
+
+    // Exposed only under an explicit flag, so the shipping bundle exports nothing
+    // extra while `tools/chime-test.mjs` can still reach the real functions.
+    if (globalThis.__PET_WHALE_TEST__ === true) {
+      globalThis.__PET_WHALE_AUDIO__ = {
+        renderVoice, renderChime, chimeOutput, TONES, DEFAULT_TONE, VOICE_GAIN, CHIME_MASTER, NOTE_GAP,
+      };
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Styles
+     * ------------------------------------------------------------------ */
+
+    const STYLES = `
+.${PREFIX}-root{position:fixed;right:22px;bottom:20px;z-index:60;display:flex;flex-direction:column;align-items:flex-end;gap:10px;font-family:inherit;color:var(--dsw-alias-label-primary,#1b1b1f);-webkit-user-select:none;user-select:none}
+.${PREFIX}-lyr{position:relative;width:96px;height:88px;display:block;cursor:pointer;border:0;padding:0;background:transparent;color:inherit;animation:${PREFIX}-float 5.2s ease-in-out infinite}
+.${PREFIX}-lyr:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#4d6bfe);outline-offset:6px;border-radius:16px}
+.${PREFIX}-lyr[data-busy="1"]{animation-duration:2.1s}
+.${PREFIX}-whale{width:96px;height:88px;display:block;overflow:visible;filter:drop-shadow(0 8px 18px rgba(45,86,220,.28))}
+.${PREFIX}-body{transform-box:fill-box;transform-origin:50% 60%;animation:${PREFIX}-bob 3.4s ease-in-out infinite}
+.${PREFIX}-lyr[data-busy="1"] .${PREFIX}-body{animation-duration:1.15s}
+.${PREFIX}-edge{pointer-events:none}
+.${PREFIX}-bub{transform-box:fill-box;transform-origin:50% 50%;animation:${PREFIX}-rise 2.9s ease-out infinite;opacity:0}
+.${PREFIX}-bub2{animation-delay:.9s}
+.${PREFIX}-bub3{animation-delay:1.8s}
+.${PREFIX}-ring{transform-box:fill-box;transform-origin:50% 50%;animation:${PREFIX}-spin 1.6s linear infinite;opacity:0;transition:opacity .25s ease}
+.${PREFIX}-lyr[data-busy="1"] .${PREFIX}-ring{opacity:.9}
+.${PREFIX}-glow{opacity:0;transition:opacity .4s ease}
+.${PREFIX}-lyr[data-busy="1"] .${PREFIX}-glow{opacity:.5;animation:${PREFIX}-pulse 1.9s ease-in-out infinite}
+/* Completion flash: a distinct celebratory pulse, so the end of work is
+   unmistakable even with sound muted or the tab in the background. */
+.${PREFIX}-lyr[data-mood="done"] .${PREFIX}-glow{opacity:.95;animation:${PREFIX}-flash .9s ease-out 2}
+.${PREFIX}-lyr[data-mood="error"] .${PREFIX}-glow{opacity:.9;animation:${PREFIX}-flash 1.1s ease-out 1;fill:var(--dsw-alias-state-error-primary,#e5484d)}
+/* Completion spout. It leaves the blowhole, which is the V-notch in the back
+   profile: measured on the outline, x 12.45 is where the back drops from y 0.66
+   to y 2.96, and 2.96 is the notch vertex. Emitting from the high arm instead put
+   the water on the fluke stock, so the origin is the vertex. The strand is drawn
+   around a local origin so the keyframes can throw it upward. */
+.${PREFIX}-spout{transform-box:view-box;transform-origin:12.45px 2.9px;opacity:0}
+.${PREFIX}-lyr[data-mood="done"] .${PREFIX}-spout{animation:${PREFIX}-spout 1.5s cubic-bezier(.2,.7,.3,1) 1}
+.${PREFIX}-badge{position:absolute;right:2px;bottom:12px;min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:var(--dsw-alias-brand-primary,#4d6bfe);color:#fff;font-size:11px;line-height:18px;text-align:center;font-variant-numeric:tabular-nums;box-shadow:0 2px 6px rgba(0,0,0,.22)}
+@keyframes ${PREFIX}-bob{0%,100%{transform:translateY(0) rotate(-1.2deg)}50%{transform:translateY(-7px) rotate(1.2deg)}}
+@keyframes ${PREFIX}-rise{0%{transform:translateY(6px) scale(.4);opacity:0}25%{opacity:.85}100%{transform:translateY(-26px) scale(1.15);opacity:0}}
+@keyframes ${PREFIX}-spin{to{transform:rotate(360deg)}}
+@keyframes ${PREFIX}-pulse{0%,100%{opacity:.28}50%{opacity:.6}}
+@keyframes ${PREFIX}-flash{0%{opacity:.25}35%{opacity:1}100%{opacity:.2}}
+@keyframes ${PREFIX}-float{0%,100%{transform:translateY(0)}50%{transform:translateY(-3px)}}
+/* A short burst up and outward, then a quick fade as it falls back. */
+@keyframes ${PREFIX}-spout{0%{opacity:0;transform:scaleY(.15) translateY(0)}12%{opacity:1}45%{opacity:1;transform:scaleY(1) translateY(0)}100%{opacity:0;transform:scaleY(1.12) translateY(-1.4px)}}
+@keyframes ${PREFIX}-slide{from{opacity:0;transform:translateY(10px) scale(.985)}to{opacity:1;transform:none}}
+.${PREFIX}-panel{width:390px;max-width:min(92vw,390px);max-height:min(90vh,860px);display:flex;flex-direction:column;min-height:0;overflow:hidden;border-radius:14px;border:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.1));background:var(--dsw-alias-bg-overlay,#fff);box-shadow:0 18px 48px rgba(16,24,48,.24);animation:${PREFIX}-slide .22s ease-out}
+.${PREFIX}-head{display:flex;align-items:center;gap:9px;padding:11px 13px;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.1));background:var(--dsw-alias-bg-layer-2,rgba(0,0,0,.02));flex:none}
+/* The scrolling region. Everything between the pinned header and footer lives
+   here and scrolls as one surface, which is what keeps the footer inside the
+   panel: sizing the RECORD LIST as the flexible child instead let its automatic
+   minimum push the total content past the panel's max-height, and the footer was
+   clipped away. An explicit min-height:0 is required, or the auto floor returns. */
+.${PREFIX}-scroll{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}
+.${PREFIX}-dot{width:8px;height:8px;border-radius:50%;background:var(--dsw-alias-state-idle-primary,#9aa4b8);flex:none}
+.${PREFIX}-dot[data-busy="1"]{background:var(--dsw-alias-brand-primary,#4d6bfe);animation:${PREFIX}-pulse 1.4s ease-in-out infinite}
+.${PREFIX}-title{font-size:13px;font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.${PREFIX}-status{padding:11px 13px;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.1));display:flex;flex-direction:column;gap:4px;flex:none}
+.${PREFIX}-statusline{font-size:12.5px;font-weight:600;display:flex;align-items:center;gap:7px}
+.${PREFIX}-sub{font-size:11.5px;color:var(--dsw-alias-label-secondary,#6b7280);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+// The record list is a plain block inside the scrolling body. A moderate floor
+// keeps a row or two readable when the sections above are tall, without letting
+// the list dictate the panel's height.
+.${PREFIX}-list{padding:5px 0;min-height:220px}
+.${PREFIX}-row{display:flex;gap:9px;padding:8px 13px;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.06))}
+.${PREFIX}-row:last-child{border-bottom:0}
+.${PREFIX}-rail{width:2px;border-radius:1px;background:var(--dsw-alias-brand-primary,#4d6bfe);opacity:.55;flex:none}
+.${PREFIX}-row[data-error="1"] .${PREFIX}-rail{background:var(--dsw-alias-state-error-primary,#e5484d);opacity:.85}
+.${PREFIX}-rowmain{min-width:0;flex:1;display:flex;flex-direction:column;gap:3px}
+.${PREFIX}-meta{display:flex;align-items:baseline;gap:7px;font-size:11px;color:var(--dsw-alias-label-secondary,#6b7280)}
+.${PREFIX}-seq{font-variant-numeric:tabular-nums;font-weight:600;color:var(--dsw-alias-label-primary,#1b1b1f)}
+.${PREFIX}-prompt{font-size:12.5px;line-height:1.45;word-break:break-word;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.${PREFIX}-muted{color:var(--dsw-alias-label-secondary,#6b7280);font-style:italic}
+.${PREFIX}-reply{font-size:11.5px;line-height:1.42;color:var(--dsw-alias-label-secondary,#6b7280);word-break:break-word;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.${PREFIX}-tags{display:flex;flex-wrap:wrap;gap:5px;margin-top:1px}
+.${PREFIX}-tag{font-size:10.5px;line-height:15px;padding:0 6px;border-radius:5px;background:var(--dsw-alias-bg-layer-2,rgba(0,0,0,.05));color:var(--dsw-alias-label-secondary,#6b7280);font-variant-numeric:tabular-nums}
+.${PREFIX}-tag[data-warn="1"]{background:color-mix(in srgb,var(--dsw-alias-state-error-primary,#e5484d) 16%,transparent);color:var(--dsw-alias-state-error-primary,#e5484d)}
+.${PREFIX}-empty{padding:24px 16px;text-align:center;font-size:12px;color:var(--dsw-alias-label-secondary,#6b7280);line-height:1.7}
+.${PREFIX}-acct{border-bottom:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.1));padding:9px 13px 11px;display:flex;flex-direction:column;gap:3px;background:var(--dsw-alias-bg-layer-2,rgba(0,0,0,.02));flex:none}
+.${PREFIX}-secthead{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11.5px;font-weight:600;margin-bottom:4px}
+.${PREFIX}-secthead .${PREFIX}-note{font-weight:400}
+.${PREFIX}-sectsub{font-size:10.5px;font-weight:600;color:var(--dsw-alias-label-secondary,#6b7280);margin:7px 0 2px;letter-spacing:.02em}
+.${PREFIX}-kv{display:grid;grid-template-columns:1fr auto auto;align-items:baseline;gap:8px;font-size:11.5px;line-height:1.5}
+.${PREFIX}-k{color:var(--dsw-alias-label-secondary,#6b7280);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.${PREFIX}-v{font-variant-numeric:tabular-nums;font-weight:600}
+.${PREFIX}-kv .${PREFIX}-note{font-variant-numeric:tabular-nums;min-width:62px;text-align:right}
+.${PREFIX}-kvtot{margin-top:3px;padding-top:4px;border-top:1px dashed var(--dsw-alias-border-l1,rgba(0,0,0,.12));font-size:12.5px}
+.${PREFIX}-acctnote{margin-top:5px;line-height:1.55;text-align:left;white-space:normal}
+.${PREFIX}-sel{font:inherit;font-size:11px;padding:2px 5px;border-radius:6px;max-width:150px;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.14));background:var(--dsw-alias-bg-layer-1,transparent);color:var(--dsw-alias-label-primary,#1b1b1f)}
+.${PREFIX}-sels{display:flex;align-items:center;gap:5px;flex:none}
+.${PREFIX}-sels .${PREFIX}-sel{max-width:96px}
+.${PREFIX}-empty2{padding:12px 2px;font-size:11.5px;color:var(--dsw-alias-label-secondary,#6b7280);line-height:1.6}
+.${PREFIX}-pending{margin:2px 0 4px;padding:4px 7px;border-radius:6px;font-size:11px;background:var(--dsw-alias-bg-layer-1,rgba(0,0,0,.05));color:var(--dsw-alias-label-secondary,#6b7280)}
+.${PREFIX}-foot{display:flex;align-items:center;gap:8px;padding:8px 11px;border-top:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.1));flex:none}
+.${PREFIX}-btn{font:inherit;font-size:11.5px;padding:4px 10px;border-radius:7px;cursor:pointer;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.14));background:var(--dsw-alias-bg-layer-1,transparent);color:var(--dsw-alias-label-primary,#1b1b1f)}
+.${PREFIX}-btn:hover{background:var(--dsw-alias-bg-layer-2,rgba(0,0,0,.04))}
+.${PREFIX}-btn:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#4d6bfe);outline-offset:1px}
+.${PREFIX}-grow{flex:1}
+.${PREFIX}-note{font-size:10.5px;color:var(--dsw-alias-label-secondary,#6b7280)}
+@media (prefers-reduced-motion:reduce){.${PREFIX}-lyr,.${PREFIX}-body,.${PREFIX}-bub,.${PREFIX}-ring,.${PREFIX}-glow,.${PREFIX}-spout,.${PREFIX}-panel{animation:none!important}}
+`;
+
+    /** Insert the stylesheet as a React element, so unmounting removes it. */
+    function Stylesheet() {
+      return h('style', { 'data-plugin': PREFIX }, STYLES);
+    }
+
+    /* ------------------------------------------------------------------ *
+     * The whale
+     * ------------------------------------------------------------------ */
+
+    /**
+     * The whale mark. `busy` drives the working animation.
+     *
+     * **Draw exactly one path — the official one.** `FISH_LOGO_PATH` is the
+     * complete DeepSeek silhouette (flipper, fluke and all), and an earlier
+     * revision of this component wrecked it by compositing shapes of its own
+     * invention on top: a hand-written "specular highlight" polygon and a second
+     * tail fin. Both landed inside the body and produced a white blob over the
+     * whale. The official mark is a single filled shape; the only additions that
+     * belong are a halo *behind* it and strokes *on its outline*.
+     */
+    function Whale({ busy, mood }) {
+      return h(
+        'svg',
+        {
+          className: `${PREFIX}-whale`,
+          viewBox: '-2 -3 27.5 25.5',
+          role: 'img',
+          'aria-hidden': 'true',
+          focusable: 'false',
+        },
+        h(
+          'defs',
+          null,
+          h(
+            'linearGradient',
+            { id: `${PREFIX}-grad`, x1: '2', y1: '1', x2: '22', y2: '17', gradientUnits: 'userSpaceOnUse' },
+            h('stop', { offset: '0', stopColor: '#6D93FF' }),
+            h('stop', { offset: '.52', stopColor: '#4D6BFE' }),
+            h('stop', { offset: '1', stopColor: '#2B3FD6' }),
+          ),
+          h(
+            'radialGradient',
+            { id: `${PREFIX}-glow`, cx: '.5', cy: '.5', r: '.5' },
+            h('stop', { offset: '0', stopColor: '#7BA0FF', stopOpacity: '.85' }),
+            h('stop', { offset: '1', stopColor: '#7BA0FF', stopOpacity: '0' }),
+          ),
+        ),
+        // Behind the body only: a halo, never a fill over it. The body itself
+        // stays fully opaque so nothing shows through the silhouette.
+        h('circle', { className: `${PREFIX}-glow`, cx: '11.5', cy: '9', r: '12.5', fill: `url(#${PREFIX}-glow)` }),
+        h(
+          'g',
+          { className: `${PREFIX}-body` },
+          // The whale. One path, official geometry, nothing composited on top.
+          h('path', { d: WHALE_PATH, fill: `url(#${PREFIX}-grad)` }),
+          // Depth: the SAME geometry stroked with a light blue. It traces the
+          // boundary and the logo's interior details without inventing any shape,
+          // which is what keeps it from covering the body. The official mark
+          // already renders those details insetted like this, so the inset look
+          // is faithful rather than decorative.
+          h('path', {
+            className: `${PREFIX}-edge`,
+            d: WHALE_PATH,
+            fill: 'none',
+            stroke: '#9DB8FF',
+            strokeWidth: '0.36',
+            strokeLinejoin: 'round',
+            opacity: '.55',
+          }),
+        ),
+        // The completion spout, in the blowhole notch. Hidden unless `mood` is
+        // 'done'. Anchored at the notch vertex (12.45, 2.9) and sized to read at
+        // the 96px render: a plume shorter than the fluke disappears at panel
+        // scale, and a thin one reads as an antenna rather than as water.
+        h(
+          'g',
+          { className: `${PREFIX}-spout`, fill: '#8FB4FF' },
+          // The central plume: a lobe that widens as it rises.
+          h('path', {
+            d: 'M12.45 2.9C11.5 1.2 11.35 -0.6 12.45 -1.9C13.55 -0.6 13.4 1.2 12.45 2.9Z',
+            opacity: '.95',
+          }),
+          // Side fans, so it reads as a spray rather than a spike.
+          h('path', { d: 'M12.45 2.9C11.35 2.5 10.2 1.9 9.2 1.1C10.3 1.4 11.5 2.1 12.45 2.9Z', opacity: '.72' }),
+          h('path', { d: 'M12.45 2.9C13.55 2.5 14.7 1.9 15.7 1.1C14.6 1.4 13.4 2.1 12.45 2.9Z', opacity: '.72' }),
+          // Droplets flung clear of the plume.
+          h('circle', { cx: '11.15', cy: '0.1', r: '0.34', opacity: '.85' }),
+          h('circle', { cx: '13.75', cy: '-0.25', r: '0.28', opacity: '.75' }),
+          h('circle', { cx: '12.45', cy: '-2.4', r: '0.26', opacity: '.7' }),
+          h('circle', { cx: '11.6', cy: '-1.5', r: '0.18', opacity: '.6' }),
+        ),
+        // Rising bubbles, clipped clear of the silhouette so they read as water
+        // rather than as marks on the whale.
+        h('circle', { className: `${PREFIX}-bub`, cx: '2.2', cy: '12.4', r: '0.8', fill: '#7BA0FF', opacity: '.65' }),
+        h('circle', { className: `${PREFIX}-bub ${PREFIX}-bub2`, cx: '1.4', cy: '9.2', r: '0.55', fill: '#9DB8FF', opacity: '.6' }),
+        h('circle', { className: `${PREFIX}-bub ${PREFIX}-bub3`, cx: '2.9', cy: '15.6', r: '0.5', fill: '#9DB8FF', opacity: '.6' }),
+        // Working ring: a dashed arc orbiting the mark, outside the silhouette.
+        h('circle', {
+          className: `${PREFIX}-ring`,
+          cx: '11.5',
+          cy: '8.5',
+          r: '14.2',
+          fill: 'none',
+          stroke: '#4D6BFE',
+          strokeWidth: '0.7',
+          strokeLinecap: 'round',
+          strokeDasharray: '5 44',
+        }),
+      );
+    }
+
+    /* ------------------------------------------------------------------ *
+     * The panel
+     * ------------------------------------------------------------------ */
+
+    /** One ledger row. */
+    function RecordRow({ record, index }) {
+      const hasError = typeof record.error === 'string' && record.error !== '';
+      return h(
+        'div',
+        { className: `${PREFIX}-row`, 'data-error': hasError ? '1' : undefined },
+        h('div', { className: `${PREFIX}-rail` }),
+        h(
+          'div',
+          { className: `${PREFIX}-rowmain` },
+          h(
+            'div',
+            { className: `${PREFIX}-meta` },
+            h('span', { className: `${PREFIX}-seq` }, `#${record.id ?? index + 1}`),
+            h('span', null, clockTime(record.endedAt ?? record.startedAt ?? Date.now())),
+            h('span', null, duration(record.durationMs)),
+            record.origin === 'local' ? h('span', { className: `${PREFIX}-tag` }, 'local') : null,
+          ),
+          record.prompt === '' || record.prompt === undefined
+            ? h('div', { className: `${PREFIX}-prompt ${PREFIX}-muted` }, '（未采集到提示词 · prompt not captured）')
+            : h('div', { className: `${PREFIX}-prompt` }, record.prompt),
+          record.reply !== '' && record.reply !== undefined
+            ? h('div', { className: `${PREFIX}-reply` }, record.reply)
+            : null,
+          hasError ? h('div', { className: `${PREFIX}-reply`, style: { color: 'var(--dsw-alias-state-error-primary,#e5484d)' } }, record.error) : null,
+          h(
+            'div',
+            { className: `${PREFIX}-tags` },
+            record.label !== undefined && record.label !== '' ? h('span', { className: `${PREFIX}-tag` }, record.label) : null,
+            h('span', { className: `${PREFIX}-tag` }, `${record.tools ?? 0} tools`),
+            h('span', { className: `${PREFIX}-tag` }, `${record.turns ?? 0} turns`),
+            h('span', { className: `${PREFIX}-tag` }, `${record.steps ?? 0} steps`),
+            record.prompt !== undefined && record.prompt !== ''
+              ? h('span', { className: `${PREFIX}-tag` }, `${glyphs(record.prompt)} glyphs`)
+              : null,
+          ),
+        ),
+      );
+    }
+
+    /**
+     * The accounting block: what this session has cost and where the money went.
+     *
+     * `cost` is computed once per render from the Host snapshot's token buckets,
+     * so the per-episode rows and the session total are priced by the same rule
+     * and always agree.
+     */
+    function AccountSection({ session, records, cost, rate, model, models, table, currency, symbol, peak, balance, onModel, onCurrency }) {
+      if (session === undefined || session.tokens === undefined) {
+        return h(
+          'div',
+          { className: `${PREFIX}-acct` },
+          h(
+            'div',
+            { className: `${PREFIX}-secthead` },
+            h('span', null, '用量与花费 · Usage & cost'),
+            h('span', { className: `${PREFIX}-note` }, '等待数据…'),
+          ),
+          h(
+            'div',
+            { className: `${PREFIX}-empty2` },
+            '还没有可用的 token 数据。',
+            h('br'),
+            h('span', { className: `${PREFIX}-note` }, 'No token data yet — send a prompt, then reopen this panel.'),
+          ),
+        );
+      }
+
+      const t = session.tokens;
+      const empty = tokensTotal(t) === 0;
+      const hit = t.cacheReadTokens;
+      const miss = t.inputTokens + t.cacheWriteTokens;
+      const inputSide = hit + miss;
+      const share = (value, whole) => (whole > 0 ? `${Math.round((value / whole) * 100)}%` : '0%');
+
+      /** One label/value row inside the grid. */
+      const row = (label, value, extra) =>
+        h(
+          'div',
+          { className: `${PREFIX}-kv` },
+          h('span', { className: `${PREFIX}-k` }, label),
+          h('span', { className: `${PREFIX}-v` }, value),
+          extra === undefined ? null : h('span', { className: `${PREFIX}-note` }, extra),
+        );
+
+      return h(
+        'div',
+        { className: `${PREFIX}-acct` },
+        h(
+          'div',
+          { className: `${PREFIX}-secthead` },
+          h('span', null, '用量与花费 · Usage & cost'),
+          h(
+            'div',
+            { className: `${PREFIX}-sels` },
+            h(
+              'select',
+              {
+                className: `${PREFIX}-sel`,
+                value: currency,
+                onChange: (event) => onCurrency(event.target.value),
+                'aria-label': 'Billing currency',
+              },
+              currencyOptions().map((option) => h('option', { key: option.key, value: option.key }, option.label)),
+            ),
+            h(
+              'select',
+              {
+                className: `${PREFIX}-sel`,
+                value: model,
+                onChange: (event) => onModel(event.target.value),
+                'aria-label': 'Pricing model',
+              },
+              Object.keys(models).map((key) => h('option', { key, value: key }, models[key].label)),
+            ),
+          ),
+        ),
+        /* Even with no numbers yet the STRUCTURE is shown, so the block reads as
+           "not settled yet" rather than "broken". provider usage only exists once
+           a model step settles, which is why this can legitimately be zero while
+           a reply is still streaming. */
+        empty
+          ? h(
+              'div',
+              { className: `${PREFIX}-pending` },
+              '尚无结算数据 · awaiting the first settlement',
+            )
+          : null,
+        h(
+          'div',
+          { className: `${PREFIX}-kv` },
+          h('span', { className: `${PREFIX}-k` }, '本会话时长 Session'),
+          h('span', { className: `${PREFIX}-v` }, session.elapsedMs === undefined ? '—' : duration(session.elapsedMs)),
+          h('span', { className: `${PREFIX}-note` }, `${Math.round(records.length)} 次交互`),
+        ),
+        h(
+          'div',
+          { className: `${PREFIX}-kv` },
+          h('span', { className: `${PREFIX}-k` }, '缓存命中率 Cache hit'),
+          h('span', { className: `${PREFIX}-v` }, share(hit, inputSide)),
+          h('span', { className: `${PREFIX}-note` }, `${count(hit)} / ${count(inputSide)}`),
+        ),
+        h(
+          'div',
+          { className: `${PREFIX}-kv` },
+          h('span', { className: `${PREFIX}-k` }, '计费总 token Billed'),
+          h('span', { className: `${PREFIX}-v` }, count(session.totalTokens)),
+          h('span', { className: `${PREFIX}-note` }, `${count(t.requests)} 次请求`),
+        ),
+        // Account balance: the wallets the Platform reports, in their own
+        // currency, as a reference next to what this session has spent.
+        balance === undefined
+          ? null
+          : h(
+              'div',
+              { className: `${PREFIX}-kv` },
+              h('span', { className: `${PREFIX}-k` }, '账户余额 Balance'),
+              h(
+                'span',
+                { className: `${PREFIX}-v` },
+                balance.wallets.length === 0
+                  ? '—'
+                  : balance.wallets.map((wallet) => walletText(wallet)).join(' · '),
+              ),
+              h(
+                'span',
+                { className: `${PREFIX}-note` },
+                balance.bonusWallets.length === 0
+                  ? (balance.error === undefined ? '' : '读取失败')
+                  : `赠送 ${balance.bonusWallets.map((wallet) => walletText(wallet)).join(' · ')}`,
+              ),
+            ),
+        // Token buckets and their individual cost, so the split is visible rather
+        // than only the sum.
+        h('div', { className: `${PREFIX}-sectsub` }, 'Token 构成 · Breakdown'),
+        [
+          ['输入 · 缓存未命中 Cache miss', t.inputTokens, cost.inputCost],
+          ['输入 · 缓存命中 Cache hit', t.cacheReadTokens, cost.cacheHitCost],
+          ...(t.cacheWriteTokens > 0 ? [['缓存写入 Cache write（按 miss 计费）', t.cacheWriteTokens, undefined]] : []),
+          ['输出 Output', t.outputTokens, cost.outputCost],
+          ...(t.reasoningTokens > 0 ? [['　其中思维链 of which reasoning', t.reasoningTokens, undefined]] : []),
+        ].map(([label, value, amount], index) =>
+          h(
+            'div',
+            { className: `${PREFIX}-kv`, key: `${index}-${label}` },
+            h('span', { className: `${PREFIX}-k` }, label),
+            h('span', { className: `${PREFIX}-v` }, count(value)),
+            h('span', { className: `${PREFIX}-note` }, amount === undefined ? '' : money(amount, symbol)),
+          ),
+        ),
+        h('div', { className: `${PREFIX}-sectsub` }, '花费明细 · Cost'),
+        row('输入侧 Input side', money(cost.inputCost, symbol), `miss ${symbol}${rate.miss}/M`),
+        row('输出侧 Output', money(cost.outputCost, symbol), `${symbol}${rate.output}/M`),
+        h(
+          'div',
+          { className: `${PREFIX}-kv ${PREFIX}-kvtot` },
+          h('span', { className: `${PREFIX}-k` }, '合计 Total'),
+          h('span', { className: `${PREFIX}-v` }, money(cost.total, symbol)),
+          h(
+            'span',
+            { className: `${PREFIX}-note` },
+            peak ? '高峰价 peak' : '低谷价 off-peak',
+          ),
+        ),
+        h(
+          'div',
+          { className: `${PREFIX}-note ${PREFIX}-acctnote` },
+          `价格 ${models[model].label}（${table.label}）：缓存命中 ${symbol}${rate.hit}/M · 未命中 ${symbol}${rate.miss}/M · 输出 ${symbol}${rate.output}/M（每 1M token）`,
+          h('br'),
+          '高峰时段为北京时间周一至周五 09–12、14–18 点（即 UTC 01–04、06–10）；中国法定节假日按低谷计费，此处未扣除，因此节假日可能高估。',
+          session.source === 'client'
+            ? h('span', null, h('br'), '数据来源：浏览器会话投影（主机端尚未上报，因此没有分次明细与请求次数）。')
+            : null,
+        ),
+        records.length > 0
+          ? h(
+              'div',
+              { className: `${PREFIX}-sectsub` },
+              '每次交互 · Per interaction',
+            )
+          : null,
+        records.slice(0, 12).map((record) =>
+          h(
+            'div',
+            { className: `${PREFIX}-kv`, key: `tok-${record.sessionId}-${record.startedAt}` },
+            h(
+              'span',
+              { className: `${PREFIX}-k` },
+              `#${record.id ?? '—'} ${clockTime(record.endedAt ?? record.startedAt ?? 0)}`,
+            ),
+            h(
+              'span',
+              { className: `${PREFIX}-v` },
+              record.tokens === undefined ? '—' : count(tokensTotal(record.tokens)),
+            ),
+            h(
+              'span',
+              { className: `${PREFIX}-note` },
+              record.tokens === undefined
+                ? ''
+                : `${money(priceTokens(record.tokens, rate).total, symbol)} · ${duration(record.durationMs)}`,
+            ),
+          ),
+        ),
+      );
+    }
+
+    /**
+     * The expanded secondary page: what Harness is doing right now, and one row
+     * per finished interaction.
+     */
+    function Panel({ view, records, onClear, onClose, soundOn, onToggleSound, onPreviewSound, onPickTone, tone, canSound, accounting }) {
+      const active = view.active;
+      return h(
+        'div',
+        { className: `${PREFIX}-panel`, role: 'dialog', 'aria-label': 'Whale pet interactions' },
+        h(
+          'div',
+          { className: `${PREFIX}-head` },
+          h('span', { className: `${PREFIX}-dot`, 'data-busy': view.busy ? '1' : undefined }),
+          h('span', { className: `${PREFIX}-title` }, '🐋 Whale pet · interaction log'),
+          h(
+            'button',
+            { className: `${PREFIX}-btn`, type: 'button', onClick: onClose, 'aria-label': 'Collapse' },
+            '收起',
+          ),
+        ),
+        h(
+          'div',
+          { className: `${PREFIX}-scroll` },
+          h(
+            'div',
+            { className: `${PREFIX}-status` },
+            h(
+              'div',
+              { className: `${PREFIX}-statusline` },
+              h('span', null, view.busy ? '● 工作中 Working' : view.status === 'error' ? '● 出错 Error' : '○ 空闲 Idle'),
+              active.length > 0 ? h('span', { className: `${PREFIX}-tag` }, `${active.length} active`) : null,
+            ),
+            active.length > 0
+              ? active.map((item) =>
+                  h(
+                    'div',
+                    { className: `${PREFIX}-sub`, key: item.sessionId },
+                    `${item.label} · ${item.prompt === '' ? 'working…' : item.prompt}${typeof item.startedAt === 'number' ? ` · ${duration(Date.now() - item.startedAt)}` : ''}`,
+                  ),
+                )
+              : h('div', { className: `${PREFIX}-sub` }, `已记录 ${records.length} 次交互 · total ${records.length} interactions`),
+            view.disagrees
+              ? h(
+                  'div',
+                  { className: `${PREFIX}-note` },
+                  '主机端仍报告忙碌，但浏览器已看不到运行中的会话，此处以浏览器为准。',
+                )
+              : null,
+          ),
+          h(AccountSection, accounting),
+          h(
+            'div',
+            { className: `${PREFIX}-list` },
+            records.length === 0
+              ? h(
+                  'div',
+                  { className: `${PREFIX}-empty` },
+                  '还没有交互记录。',
+                  h('br'),
+                  '发一条消息给 Harness，这里就会出现一条记录。',
+                  h('br'),
+                  h('span', { className: `${PREFIX}-note` }, 'No interactions yet — send a prompt and a row appears here.'),
+                )
+              : records.map((record, index) => h(RecordRow, { key: `${record.sessionId ?? 'x'}-${record.startedAt ?? index}-${index}`, record, index })),
+          ),
+        ),
+        h(
+          'div',
+          { className: `${PREFIX}-foot` },
+          h(
+            'button',
+            {
+              className: `${PREFIX}-btn`,
+              type: 'button',
+              onClick: onToggleSound,
+              disabled: canSound === false,
+              title: canSound === false ? 'This browser exposes no audio output' : undefined,
+            },
+            soundOn ? '🔔 音效 On' : '🔕 音效 Off',
+          ),
+          // The tone picker: switching试听 immediately, so the choice is made by
+          // ear rather than by name.
+          h(
+            'select',
+            {
+              className: `${PREFIX}-sel`,
+              value: tone,
+              disabled: soundOn === false,
+              onChange: (event) => onPickTone(event.target.value),
+              title: TONES[tone]?.hint ?? '',
+              'aria-label': 'Completion tone',
+            },
+            Object.entries(TONES).map(([key, value]) => h('option', { key, value: key }, value.label)),
+          ),
+          h(
+            'button',
+            {
+              className: `${PREFIX}-btn`,
+              type: 'button',
+              onClick: onPreviewSound,
+              disabled: soundOn === false,
+              title: '试听完成音效 · Preview the completion cue',
+            },
+            '▶',
+          ),
+          h('span', { className: `${PREFIX}-grow` }),
+          h('button', { className: `${PREFIX}-btn`, type: 'button', onClick: onClear }, '清空'),
+        ),
+      );
+    }
+
+    /**
+     * Decide whether one observed episode should ring the chime.
+     *
+     * Both observers feed through here so an episode rings at most once. Every
+     * high-water mark is PER SESSION: a single global one would let a later
+     * episode in one session suppress an earlier one in another (two subagents
+     * finishing out of order was enough to silence a cue). The windowed start-time
+     * match exists because the client's transition and the Host's record describe
+     * the same episode with timestamps taken milliseconds apart.
+     *
+     * Extracted as a pure function so `tools/client-test.mjs` can test the rule
+     * directly instead of through a rendered component.
+     *
+     * @param memory - `{ sessions: Map, baseline: Map, lastRecordId }`, mutated in place.
+     * @param input - one observation: `{ source, sessionId, startedAt, recordId, failed }`.
+     * @returns `'silent'`, `'ring'`, or `'mood-only'` (already rang; upgrade the mood).
+     */
+    function decideCue(memory, input) {
+      const { source, sessionId, startedAt, failed = false } = input;
+      const key = String(sessionId ?? 'unknown');
+      const stamp = typeof startedAt === 'number' ? startedAt : Date.now();
+      const seen = memory.sessions.get(key);
+      const high = memory.baseline.get(key);
+
+      if (source === 'local') {
+        if (high === undefined) {
+          // First sight of this session's feed: establish a baseline only, so the
+          // pet never chimes for work that finished before the page loaded.
+          memory.baseline.set(key, stamp);
+          memory.sessions.set(key, [...(seen ?? []), stamp].slice(-8));
+          return 'silent';
+        }
+        if (stamp <= high) return 'silent';
+        memory.baseline.set(key, stamp);
+        memory.sessions.set(key, [...(seen ?? []), stamp].slice(-8));
+        return 'ring';
+      }
+
+      if (memory.lastRecordId === undefined) {
+        memory.lastRecordId = input.recordId;
+        memory.sessions.set(key, [...(seen ?? []), stamp].slice(-8));
+        return 'silent';
+      }
+      if (input.recordId === memory.lastRecordId) return 'silent';
+      memory.lastRecordId = input.recordId;
+      if (Array.isArray(seen) && seen.some((value) => Math.abs(value - stamp) < 2000)) {
+        return failed ? 'mood-only' : 'silent';
+      }
+      memory.sessions.set(key, [...(seen ?? []), stamp].slice(-8));
+      return 'ring';
+    }
+
+    /* ------------------------------------------------------------------ *
+     * The pet
+     * ------------------------------------------------------------------ */
+
+    /**
+     * Root-scoped pet. It renders in `shell.overlay`, so it must stay out of the
+     * way: a fixed 96px mark in the corner, and the panel only while open.
+     */
+    function WhalePet(props) {
+      // Root standard kit: both hooks arrive from the ui-session root source.
+      const useSessions = props.useSessions;
+      const useSessionStatus = props.useSessionStatus;
+
+      const [hostState, setHostState] = useState({ ok: false, busy: false, active: [], records: [], feed: [], sessions: [], balance: undefined, now: undefined });
+      const [open, setOpen] = useState(false);
+      const [mood, setMood] = useState('calm');
+      const [soundOn, setSoundOn] = useState(true);
+      const [tone, setTone] = useState(() => readTone());
+      const [audioReady, setAudioReady] = useState(true);
+      const [localRecords, setLocalRecords] = useState(readStored);
+
+      const lastBusyRef = useRef(undefined);
+      const localOpenRef = useRef(new Map());
+      /** Cue memory shared by both completion observers — see `decideCue`. */
+      const cueRef = useRef({
+        sessions: new Map(),
+        baseline: new Map(),
+        lastRecordId: undefined,
+      });
+      const soundRef = useRef(true);
+      const moodTimerRef = useRef(undefined);
+
+      // `useSessions` may be absent in a composition without ui-session; the
+      // pet then relies on the Host half alone.
+      const listSnapshot =
+        typeof useSessions === 'function'
+          ? useSessions((value) => value)
+          : undefined;
+      const statusSnapshot =
+        typeof useSessionStatus === 'function'
+          ? useSessionStatus((value) => value)
+          : undefined;
+
+      /* --- sound preference --- */
+      useEffect(() => {
+        try {
+          const stored = window.localStorage.getItem(`${STORAGE_KEY}.sound`);
+          if (stored === 'off') setSoundOn(false);
+        } catch {
+          /* ignore */
+        }
+      }, []);
+      useEffect(() => {
+        soundRef.current = soundOn;
+        try {
+          window.localStorage.setItem(`${STORAGE_KEY}.sound`, soundOn ? 'on' : 'off');
+        } catch {
+          /* ignore */
+        }
+      }, [soundOn]);
+
+      /* --- unlock audio on the first user gesture (autoplay policy) --- */
+      useEffect(() => {
+        const unlock = () => {
+          audio.unlock();
+          if (audio.unavailable) setAudioReady(false);
+        };
+        window.addEventListener('pointerdown', unlock, { passive: true });
+        window.addEventListener('keydown', unlock);
+        return () => {
+          window.removeEventListener('pointerdown', unlock);
+          window.removeEventListener('keydown', unlock);
+        };
+      }, []);
+
+      /* --- poll the Host half --- */
+      useEffect(() => {
+        let stopped = false;
+        let timer;
+        const tick = async () => {
+          try {
+            const controller = new AbortController();
+            const abort = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+            const response = await fetch(ENDPOINT, { signal: controller.signal, headers: { accept: 'application/json' } });
+            window.clearTimeout(abort);
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const body = await response.json();
+            if (stopped) return;
+            setHostState({
+              ok: body?.ok === true,
+              busy: body?.busy === true,
+              active: Array.isArray(body?.active) ? body.active : [],
+              records: Array.isArray(body?.records) ? body.records : [],
+              feed: Array.isArray(body?.feed) ? body.feed : [],
+              sessions: Array.isArray(body?.sessions) ? body.sessions : [],
+              balance: body?.balance !== null && typeof body?.balance === 'object' ? body.balance : undefined,
+              now: typeof body?.now === 'number' ? body.now : undefined,
+            });
+          } catch {
+            // Keep the last known view but mark the Host half unreachable, so the
+            // ledger falls back to the client-derived one instead of showing a
+            // frozen host snapshot.
+            if (!stopped) setHostState((current) => ({ ...current, ok: false, active: [] }));
+          } finally {
+            if (!stopped) timer = window.setTimeout(tick, POLL_MS);
+          }
+        };
+        tick();
+        return () => {
+          stopped = true;
+          window.clearTimeout(timer);
+        };
+      }, []);
+
+      /* --- client-derived ledger: fold running-state transitions --- */
+      const runningIds = useMemo(() => {
+        const ids = [];
+        if (statusSnapshot instanceof Map) {
+          for (const [id, status] of statusSnapshot) {
+            if (status?.running === true) ids.push(id);
+          }
+        } else if (listSnapshot?.byId !== undefined) {
+          for (const row of Object.values(listSnapshot.byId)) {
+            if (row?.running === true) ids.push(row.sessionId);
+          }
+        }
+        return ids;
+      }, [statusSnapshot, listSnapshot]);
+
+      // The fold below must run only when the *set* of running sessions changes,
+      // not on every render. `runningIds` is a fresh array each time the selector
+      // snapshot is read, so a stable string key is the dependency that matters.
+      const runningKey = useMemo(() => [...runningIds].sort().join('\u0000'), [runningIds]);
+
+      useEffect(() => {
+        const ids = runningKey === '' ? [] : runningKey.split('\u0000');
+        const pending = localOpenRef.current;
+        const now = Date.now();
+        const seen = new Set(ids);
+        for (const id of ids) {
+          if (pending.has(id)) continue;
+          const row = listSnapshot?.byId?.[id];
+          pending.set(id, {
+            sessionId: id,
+            label: row?.displayTitle ?? row?.title ?? shortId(id),
+            startedAt: now,
+            prompt: row?.displayTitle ?? row?.title ?? '',
+          });
+        }
+        for (const [id, episode] of [...pending]) {
+          if (seen.has(id)) continue;
+          pending.delete(id);
+          const endedAt = Date.now();
+          const finished = {
+            sessionId: id,
+            label: episode.label,
+            startedAt: episode.startedAt,
+            endedAt,
+            durationMs: Math.max(0, endedAt - episode.startedAt),
+            prompt: episode.prompt,
+            reply: '',
+            tools: 0,
+            turns: 0,
+            steps: 0,
+          };
+          setLocalRecords((current) => {
+            const next = [finished, ...current].slice(0, LOCAL_RECORD_LIMIT);
+            writeStored(next);
+            return next;
+          });
+        }
+      }, [runningKey, listSnapshot]);
+
+      /**
+       * Whether the Client's own session view is loaded enough to be trusted.
+       *
+       * `useSessionStatus` resolves to a Map once the ui-session root source is
+       * live; before that it is undefined and the Client knows nothing, so the
+       * Host has to be believed. That distinction is what lets the view be
+       * corrected without ever going blind.
+       */
+      const clientKnows = statusSnapshot instanceof Map;
+
+      // When the Client last saw real work, used to bound how long a claimed
+      // "busy" is believed while the Client's own view says nothing is running.
+      const activityRef = useRef(undefined);
+      const runningCount = runningKey === '' ? 0 : runningKey.split('\u0000').length;
+      useEffect(() => {
+        if (runningCount > 0) activityRef.current = Date.now();
+      }, [runningCount, hostState.now]);
+      /** Grace period before a Host-only "busy" is treated as stale. */
+      const BUSY_GRACE_MS = 6000;
+      void BUSY_GRACE_MS;
+
+      /* --- effective view --- *
+       * `busy` is the Client's live view whenever the Client has one, because
+       * that view comes straight from session status and cannot go stale. The
+       * Host's snapshot is believed only when the Client has nothing to say.
+       *
+       * Neither a plain union nor a plain preference works here, and both were
+       * tried: preferring the Host hides work the Client can plainly see, and a
+       * union lets one stuck Host claim freeze the pet on "working" forever after
+       * the turn ended. Correcting the Host against the Client is the only shape
+       * that is right in both directions.
+       */
+      const view = useMemo(() => {
+        const running = runningKey === '' ? [] : runningKey.split('\u0000');
+        const clientBusy = running.length > 0;
+        const hostClaimsBusy = hostState.busy === true;
+        const resolved = resolveBusy({ clientKnows, clientBusy, hostBusy: hostState.busy });
+        const busy = resolved.busy;
+        const lastError = hostState.records.find((record) => typeof record.error === 'string' && record.error !== '');
+        void hostClaimsBusy;
+        return {
+          busy,
+          // The Host still claims work the Client cannot see: the two disagree,
+          // and the Client's answer is the one shown.
+          disagrees: resolved.disagrees,
+          status: busy ? 'running' : lastError !== undefined && Date.now() - (lastError.endedAt ?? 0) < 8000 ? 'error' : 'idle',
+          // The Host's richer `active` detail is used only while `busy` is true,
+          // so a stale Host entry cannot outlive the status above it.
+          active: busy && hostState.active.length > 0
+            ? hostState.active
+            : running.map((id) => {
+                const row = listSnapshot?.byId?.[id];
+                return {
+                  sessionId: id,
+                  label: row?.displayTitle ?? row?.title ?? shortId(id),
+                  startedAt: undefined,
+                  prompt: row?.displayTitle ?? row?.title ?? '',
+                };
+              }),
+        };
+      }, [hostState, runningKey, runningCount, listSnapshot, clientKnows]);
+
+      const records = useMemo(() => selectRecords(hostState.ok, hostState.records, localRecords), [
+        hostState.ok,
+        hostState.records,
+        localRecords,
+      ]);
+
+      /* --- cost accounting: one rate table, one price rule --- */
+      const [rateModel, setRateModel] = useState(() => readRates().model);
+      const [rateCurrency, setRateCurrency] = useState(() => readRates().currency);
+      const rateChoice = useMemo(() => readRates(), [rateCurrency]);
+      const rateTable = rateChoice.table;
+      const rateModels = rateChoice.models;
+      const symbol = rateChoice.symbol;
+      const peak = useMemo(() => isPeak(new Date()), [hostState.now]);
+      const rate = (rateModels[rateModel] ?? Object.values(rateModels)[0])[peak ? 'peak' : 'offPeak'];
+      // `ctx` is a stable service locator, not render state: caching it in a ref
+      // keeps it out of the dependency arrays below.
+      const servicesRef = useRef(undefined);
+      if (servicesRef.current === undefined && typeof props.ctx?.get === 'function') {
+        servicesRef.current = { get: (name) => props.ctx.get(name) };
+      }
+
+      /** Result of the retried Client-side projection read, once it lands. */
+      const [clientTokensFallback, setClientTokensFallback] = useState(undefined);
+      /**
+       * Retry the Client-side `tokenUsage` read.
+       *
+       * `sessions.refreshProjections` is asynchronous: the projection only fills
+       * in after it settles, so one synchronous read is guaranteed to see
+       * nothing on a cold panel. This polls a handful of times and stops as soon
+       * as a value arrives, so the accounting block populates without the user
+       * having to reopen it.
+       */
+      useEffect(() => {
+        if (!open) return undefined;
+        const sessions = servicesRef.current;
+        if (sessions === undefined) return undefined;
+        const rows = hostState.sessions ?? [];
+        if (rows.some((row) => row.totalTokens > 0)) return undefined;
+
+        const active = Object.values(listSnapshot?.byId ?? {}).find((row) => (row?.retainedBy?.mainView ?? 0) > 0)?.sessionId;
+        const targetId = active ?? rows[0]?.sessionId ?? runningKey.split('\u0000').filter(Boolean)[0];
+        if (targetId === undefined) return undefined;
+
+        let stopped = false;
+        let timer;
+        let attempt = 0;
+        const probe = () => {
+          if (stopped) return;
+          const tokens = readClientTokens(sessions, targetId);
+          if (tokens !== undefined) {
+            setClientTokensFallback({ sessionId: targetId, tokens });
+            return;
+          }
+          refreshClientTokens(sessions, targetId);
+          attempt += 1;
+          if (attempt < 6) timer = window.setTimeout(probe, 600);
+        };
+        probe();
+        return () => {
+          stopped = true;
+          window.clearTimeout(timer);
+        };
+      }, [open, hostState.sessions, listSnapshot, runningKey]);
+
+      /** The retried read as a panel row, if it has landed. */
+      const clientFallbackSession = useMemo(() => {
+        if (clientTokensFallback === undefined) return undefined;
+        const { sessionId, tokens } = clientTokensFallback;
+        const row = (hostState.sessions ?? []).find((entry) => entry.sessionId === sessionId);
+        return {
+          ...(row ?? { sessionId, label: shortId(sessionId) }),
+          tokens,
+          totalTokens: tokensTotal(tokens),
+          source: 'client',
+        };
+      }, [clientTokensFallback, hostState.sessions]);
+      /**
+       * The newest session that has spend, then the newest session overall.
+       * Subagent sessions also accrue tokens and appear in the snapshot, so
+       * preferring one with spend keeps the panel showing the conversation the
+       * user is actually in rather than a transient child.
+       *
+       * When the Host reported no tokens at all — a stale Host module, or a
+       * composition without it — fall back to the browser's own `tokenUsage`
+       * projection so the block still answers the question instead of going dark.
+       */
+      const accountingSession = useMemo(() => {
+        const rows = hostState.sessions ?? [];
+        const withSpend = rows.find((row) => row.totalTokens > 0);
+        if (withSpend !== undefined) return withSpend;
+
+        // No Host tokens: fall back to the browser's own projection. The session
+        // to read is the one retained by the main view — the conversation the
+        // user is looking at — then any row the Host did report, then any
+        // running session.
+        const active = Object.values(listSnapshot?.byId ?? {}).find((row) => (row?.retainedBy?.mainView ?? 0) > 0)?.sessionId;
+        const targetId = active ?? rows[0]?.sessionId ?? runningKey.split('\u0000').filter(Boolean)[0];
+        const clientTokens = readClientTokens(servicesRef.current, targetId);
+        if (clientTokens !== undefined) {
+          const row = rows.find((entry) => entry.sessionId === targetId);
+          return {
+            ...(row ?? { sessionId: targetId, label: shortId(targetId) }),
+            tokens: clientTokens,
+            totalTokens: tokensTotal(clientTokens),
+            source: 'client',
+          };
+        }
+        // Still nothing: fall back to the retried read, then to a zeroed row so
+        // the block can render its structure instead of disappearing.
+        if (clientFallbackSession !== undefined) return clientFallbackSession;
+        return {
+          sessionId: targetId,
+          label: shortId(targetId ?? ''),
+          elapsedMs: undefined,
+          totalTokens: 0,
+          tokens: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, requests: 0 },
+          source: 'client',
+        };
+      }, [hostState.sessions, listSnapshot, runningKey, clientFallbackSession]);
+      const accountingCost = useMemo(
+        () => priceTokens(accountingSession?.tokens ?? {}, rate),
+        [accountingSession, rate],
+      );
+      const chooseModel = useCallback((next) => {
+        setRateModel(next);
+        try {
+          window.localStorage.setItem(RATE_MODEL_KEY, next);
+        } catch {
+          /* the choice simply will not persist */
+        }
+      }, []);
+      const chooseCurrency = useCallback((next) => {
+        setRateCurrency(next);
+        try {
+          window.localStorage.setItem(RATE_CURRENCY_KEY, next);
+        } catch {
+          /* the choice simply will not persist */
+        }
+      }, []);
+
+      /**
+       * Completion and start cues.
+       *
+       * The CLIENT's own running-state transition is the primary trigger, not the
+       * Host half's record list. The chime must not depend on the Host being
+       * healthy: `useSessionStatus` already observes every session, so a finished
+       * episode is visible here even when the Host ledger is empty or stale.
+       *
+       * `decideCue`'s memory remembers which episodes have chimed, keyed by
+       * session and start time, so a Host record arriving moments later for the
+       * SAME episode enriches the row without ringing twice. The Host record
+       * still upgrades the cue to the error tone, which the client cannot know.
+       */
+      useEffect(() => {
+        const busy = view.busy;
+        const previousBusy = lastBusyRef.current;
+        lastBusyRef.current = busy;
+        if (previousBusy === false && busy && soundRef.current) audio.start();
+      }, [view.busy]);
+
+      /** Play one cue outcome, or only fix the mood when it already rang. */
+      const applyCue = useCallback((decision, failed) => {
+        if (decision === 'silent') return;
+        setMood(failed ? 'error' : 'done');
+        window.clearTimeout(moodTimerRef.current);
+        moodTimerRef.current = window.setTimeout(() => setMood('calm'), 2600);
+        if (decision !== 'ring' || !soundRef.current) return;
+        if (failed) audio.failed();
+        else audio.done();
+      }, []);
+
+      // Primary: an episode the client itself saw end. This is what makes the
+      // chime work even when the Host half is stale, empty, or unreachable.
+      useEffect(() => {
+        const newest = localRecords[0];
+        if (newest === undefined) return;
+        const decision = decideCue(cueRef.current, {
+          source: 'local',
+          sessionId: newest.sessionId,
+          startedAt: newest.startedAt,
+          failed: false,
+        });
+        applyCue(decision, false);
+      }, [localRecords, applyCue]);
+
+      // Secondary: the Host's record, which carries prompt text and any failure
+      // the client cannot see. It rings only if the client did not already.
+      useEffect(() => {
+        const newest = hostState.records[0];
+        if (newest === undefined) return;
+        const failed = typeof newest.error === 'string' && newest.error !== '';
+        const decision = decideCue(cueRef.current, {
+          source: 'host',
+          sessionId: newest.sessionId,
+          startedAt: newest.startedAt,
+          recordId: newest.id,
+          failed,
+        });
+        applyCue(decision, failed);
+      }, [hostState.records, applyCue]);
+
+      useEffect(() => () => window.clearTimeout(moodTimerRef.current), []);
+
+      const clearAll = useCallback(() => {
+        setLocalRecords([]);
+        writeStored([]);
+        localOpenRef.current.clear();
+        setHostState((current) => ({ ...current, records: [] }));
+      }, []);
+
+      const toggleSound = useCallback(() => {
+        setSoundOn((value) => {
+          if (!value) audio.unlock();
+          return !value;
+        });
+      }, []);
+
+      /**
+       * Preview the completion cue.
+       *
+       * A user gesture is exactly what the autoplay policy wants, so this both
+       * proves the audio path works and removes any doubt about whether the cue
+       * is audible — no need to wait for a turn to finish. Switching tone also
+       * previews, so the choice is made by ear.
+       */
+      const previewSound = useCallback(() => {
+        audio.unlock();
+        audio.done();
+      }, []);
+
+      /** Switch the completion tone and play it, so the pick is audible at once. */
+      const pickTone = useCallback((next) => {
+        setTone(next);
+        audio.setTone(next);
+        audio.unlock();
+        audio.done();
+      }, []);
+
+      const onClickPet = useCallback(() => {
+        audio.unlock();
+        setOpen((value) => !value);
+      }, []);
+
+      const busy = view.busy;
+
+      return h(
+        React.Fragment,
+        null,
+        h(Stylesheet),
+        h(
+          'div',
+          { className: `${PREFIX}-root` },
+          open
+            ? h(Panel, {
+                view,
+                records,
+                onClear: clearAll,
+                onClose: () => setOpen(false),
+                soundOn,
+                onToggleSound: toggleSound,
+                onPreviewSound: previewSound,
+                onPickTone: pickTone,
+                tone,
+                canSound: audioReady,
+                accounting: {
+                  session: accountingSession,
+                  records,
+                  cost: accountingCost,
+                  rate,
+                  model: rateModel,
+                  models: rateModels,
+                  table: rateTable,
+                  currency: rateCurrency,
+                  symbol,
+                  peak,
+                  balance: hostState.balance,
+                  onModel: chooseModel,
+                  onCurrency: chooseCurrency,
+                },
+              })
+            : null,
+          h(
+            'button',
+            {
+              className: `${PREFIX}-lyr`,
+              type: 'button',
+              onClick: onClickPet,
+              'data-busy': busy ? '1' : '0',
+              'data-mood': mood,
+              'aria-expanded': open,
+              'aria-label': busy
+                ? 'Whale pet: Harness is working. Open the interaction log.'
+                : mood === 'done'
+                  ? 'Whale pet: work just finished. Open the interaction log.'
+                  : 'Whale pet: idle. Open the interaction log.',
+              title: busy ? 'Harness 工作中 · Working' : mood === 'done' ? 'Harness 刚完成 · Finished' : 'Harness 空闲 · Idle',
+            },
+            h(Whale, { busy, mood }),
+            records.length > 0 ? h('span', { className: `${PREFIX}-badge` }, records.length > 99 ? '99+' : String(records.length)) : null,
+          ),
+        ),
+      );
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Plugin contract
+     * ------------------------------------------------------------------ */
+
+    return {
+      // `slots` is a hard dependency. The root hooks arrive through the slot kit,
+      // so a missing ui-session degrades instead of throwing.
+      inject: ['slots'],
+      apply(ctx) {
+        ctx.effect(
+          () =>
+            ctx.slots.inject('shell.overlay', () =>
+              ctx.slots.register(
+                {
+                  name: 'shell.overlay',
+                  id: 'pet-whale',
+                  order: 40,
+                  label: 'Whale pet',
+                },
+                WhalePet,
+              ),
+            ),
+          'pet-whale: shell.overlay registration',
+        );
+      },
+    };
+  },
+});

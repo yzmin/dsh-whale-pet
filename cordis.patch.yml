@@ -1,0 +1,10 @@
+# Inserts the whale pet into the profile's root entry list.
+#
+# No top-level `id` here on purpose: with an `id`, a patch's `insert` targets an
+# existing *group* entry by that id, and `pet-whale` is not a group — the loader
+# would warn "entry not found" and skip the insert, leaving the bundle enabled
+# with no plugin row. Without an `id`, the entries are appended to the root list,
+# which is what this plugin wants.
+- insert:
+    - id: pet-whale
+      name: 'dsh-whale-pet'
