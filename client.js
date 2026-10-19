@@ -1081,9 +1081,10 @@ window.__ModuleLoader__.load({
    unmistakable even with sound muted or the tab in the background. */
 .${PREFIX}-lyr[data-mood="done"] .${PREFIX}-glow{opacity:.95;animation:${PREFIX}-flash .9s ease-out 2}
 .${PREFIX}-lyr[data-mood="error"] .${PREFIX}-glow{opacity:.9;animation:${PREFIX}-flash 1.1s ease-out 1;fill:var(--dsw-alias-state-error-primary,#e5484d)}
-/* A pending permission is a blocking state: the halo blinks amber until it is
-   answered. This is a soft glow, not a ring, so the whale stays clean. */
-.${PREFIX}-lyr[data-approval="1"] .${PREFIX}-glow{opacity:.9;animation:${PREFIX}-flash 1.1s ease-out infinite;fill:var(--dsw-alias-state-warn-primary,#e0a11b)}
+/* A pending permission is a blocking state: the whale's own blue halo blinks
+   until it is answered. Keep the gradient rather than a solid warning color so
+   it still reads as part of the whale; the pulse, not the hue, carries urgency. */
+.${PREFIX}-lyr[data-approval="1"] .${PREFIX}-glow{opacity:.9;animation:${PREFIX}-flash 1.1s ease-out infinite;fill:url(#${PREFIX}-glow)}
 /* Completion spout. It leaves the blowhole, which is the V-notch in the back
    profile: measured on the outline, x 12.45 is where the back drops from y 0.66
    to y 2.96, and 2.96 is the notch vertex. Emitting from the high arm instead put
