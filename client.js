@@ -33,11 +33,25 @@ window.__ModuleLoader__.load({
      * ------------------------------------------------------------------ */
 
     const ENDPOINT = '/pet-whale/state';
-    const POLL_MS = 1500;
+    /**
+     * Poll cadence is adaptive: the Host snapshot is the only source of the
+     * interaction ledger, but an idle pet with its panel closed does not need a
+     * 1.5 s heartbeat. Work and an open panel keep the fast cadence; idle slows
+     * down; a hidden document backs off hard and refreshes immediately when it
+     * becomes visible again.
+     */
+    const POLL_MS_BUSY = 1500;
+    const POLL_MS_IDLE = 5000;
+    const POLL_MS_HIDDEN = 20000;
+    /** Re-read Client projections while the panel is open, independent of polling. */
+    const PROJECTION_TICK_MS = 1200;
     const REQUEST_TIMEOUT_MS = 4000;
     const LOCAL_RECORD_LIMIT = 120;
     const STORAGE_KEY = 'dsh.pet.whale.records.v1';
     const PREFIX = 'dsh-pet-whale';
+    /** Context-pressure thresholds, matching the chat composer's own alarm band. */
+    const CONTEXT_WARN_RATIO = 0.8;
+    const CONTEXT_CRITICAL_RATIO = 0.9;
 
     /** The official DeepSeek whale silhouette, as shipped in the Harness brand mark. */
     const WHALE_PATH =
@@ -180,14 +194,7 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Read the browser-side `tokenUsage` projection for one session.
-     *
-     * This is the fallback that keeps the accounting block useful when the Host
-     * half is stale or absent. Session projections are registered on the Client
-     * too — `dsh-token-meter` documents `tokenUsage` as carrying the durable
-     * log's `uncachedInputTokens`, `outputTokens`, `cacheReadTokens` and
-     * `cacheWriteTokens` — so the same billed breakdown is reachable without any
-     * Host round trip.
+     * Read one Client session projection by key.
      *
      * The documented shape is `SessionBinding.session.projections: ProjectionsFace`,
      * whose only declared method is `faceOf(key): ObservableSnapshot<unknown>`,
@@ -200,10 +207,11 @@ window.__ModuleLoader__.load({
      *
      * @param sessions - the `sessions` Client service, if the composition has one.
      * @param sessionId - the session to read.
-     * @returns a bucket set, or undefined when the projection is unavailable.
+     * @param key - projection key (`tokenUsage`, `contextPressure`, …).
+     * @returns the projection's snapshot, or undefined when unavailable.
      */
-    function readClientTokens(sessions, sessionId) {
-      if (sessions === undefined || sessions === null || typeof sessionId !== 'string') return undefined;
+    function readProjection(sessions, sessionId, key) {
+      if (sessions === undefined || sessions === null || typeof sessionId !== 'string' || sessionId === '') return undefined;
       try {
         if (typeof sessions.binding !== 'function') return undefined;
         const projections = sessions.binding(sessionId)?.session?.projections;
@@ -211,26 +219,45 @@ window.__ModuleLoader__.load({
 
         let projection;
         if (typeof projections.faceOf === 'function') {
-          projection = projections.faceOf('tokenUsage')?.getSnapshot?.();
+          projection = projections.faceOf(key)?.getSnapshot?.();
         }
         if (projection === undefined && typeof projections.get === 'function') {
-          projection = projections.get('tokenUsage');
+          projection = projections.get(key);
         }
-        if (projection === null || typeof projection !== 'object') return undefined;
-
-        // `uncachedInputTokens` is this projection's name for the cache-miss bucket.
-        const tokens = {
-          inputTokens: projection.uncachedInputTokens ?? 0,
-          outputTokens: projection.outputTokens ?? 0,
-          cacheReadTokens: projection.cacheReadTokens ?? 0,
-          cacheWriteTokens: projection.cacheWriteTokens ?? 0,
-          reasoningTokens: 0,
-          requests: 0,
-        };
-        return tokensTotal(tokens) > 0 ? tokens : undefined;
+        return projection !== null && typeof projection === 'object' ? projection : undefined;
       } catch {
         return undefined;
       }
+    }
+
+    /**
+     * Read the browser-side `tokenUsage` projection for one session.
+     *
+     * This is the fallback that keeps the accounting block useful when the Host
+     * half is stale or absent. Session projections are registered on the Client
+     * too — `dsh-token-meter` documents `tokenUsage` as carrying the durable
+     * log's `uncachedInputTokens`, `outputTokens`, `cacheReadTokens` and
+     * `cacheWriteTokens` — so the same billed breakdown is reachable without any
+     * Host round trip.
+     *
+     * @param sessions - the `sessions` Client service, if the composition has one.
+     * @param sessionId - the session to read.
+     * @returns a bucket set, or undefined when the projection is unavailable.
+     */
+    function readClientTokens(sessions, sessionId) {
+      const projection = readProjection(sessions, sessionId, 'tokenUsage');
+      if (projection === undefined) return undefined;
+
+      // `uncachedInputTokens` is this projection's name for the cache-miss bucket.
+      const tokens = {
+        inputTokens: projection.uncachedInputTokens ?? 0,
+        outputTokens: projection.outputTokens ?? 0,
+        cacheReadTokens: projection.cacheReadTokens ?? 0,
+        cacheWriteTokens: projection.cacheWriteTokens ?? 0,
+        reasoningTokens: 0,
+        requests: 0,
+      };
+      return tokensTotal(tokens) > 0 ? tokens : undefined;
     }
 
     /**
@@ -253,6 +280,130 @@ window.__ModuleLoader__.load({
       } catch {
         /* the projection simply stays unavailable */
       }
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Context insight (shared with dsh-context)
+     * ------------------------------------------------------------------ */
+
+    /** A finite, non-negative number, or zero. */
+    function nonNegative(value) {
+      return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+    }
+
+    /** Compact token counts for the context card: 1_000_000 → 1.0M, 42_300 → 42.3k. */
+    function compact(value) {
+      const number = nonNegative(value);
+      if (number >= 1_000_000) return `${(number / 1_000_000).toFixed(number >= 10_000_000 ? 0 : 1)}M`;
+      if (number >= 1_000) return `${(number / 1_000).toFixed(1)}k`;
+      return String(Math.round(number));
+    }
+
+    /** Map an occupancy ratio onto the card's alarm band. */
+    function contextLevel(ratio) {
+      if (ratio === undefined) return 'none';
+      if (ratio >= CONTEXT_CRITICAL_RATIO) return 'critical';
+      if (ratio >= CONTEXT_WARN_RATIO) return 'warn';
+      return 'calm';
+    }
+
+    /**
+     * Build the whale's context reading.
+     *
+     * Three Client projections are consulted, all optional:
+     *  - `contextPressure` / `contextBreakdown` — the harness' own token-meter
+     *    projections, the exact figures behind the composer's context ring;
+     *  - `contextTimeline` — dsh-context's richer session timeline, which adds
+     *    the per-category composition, model/window metadata, and compaction
+     *    and prune counters.
+     *
+     * The official pressure figure wins for occupancy because it is what the
+     * composer warns on; the timeline supplies the breakdown and history only
+     * when the official projections are missing. Nothing here mutates a
+     * projection or requires dsh-context to be installed.
+     *
+     * @param sessions - the `sessions` Client service.
+     * @param sessionId - the session to profile.
+     * @returns a plain reading for the panel, or undefined.
+     */
+    function readContext(sessions, sessionId) {
+      if (typeof sessionId !== 'string' || sessionId === '') return undefined;
+
+      const pressure = readProjection(sessions, sessionId, 'contextPressure');
+      const breakdown = readProjection(sessions, sessionId, 'contextBreakdown');
+      const timeline = readProjection(sessions, sessionId, 'contextTimeline');
+      const usage = readClientTokens(sessions, sessionId);
+
+      const current = timeline !== undefined && timeline.current !== null && typeof timeline.current === 'object' ? timeline.current : undefined;
+      const projected = nonNegative(pressure?.projectedTokens);
+      const pressureTokens = nonNegative(pressure?.pressureTokens);
+      const used = projected || pressureTokens || nonNegative(current?.total);
+      const window = nonNegative(pressure?.contextWindow) || nonNegative(timeline?.contextWindow);
+      const ratio = window > 0 && used > 0 ? Math.min(1, used / window) : undefined;
+
+      /** Composition parts, in display order, from the richest NON-EMPTY source. */
+      const parts = [];
+      const breakdownTotal = breakdown === undefined
+        ? 0
+        : nonNegative(breakdown.systemTokens) + nonNegative(breakdown.toolsTokens) + nonNegative(breakdown.messageTokens);
+      if (breakdown !== undefined && breakdownTotal > 0) {
+        parts.push(
+          { key: 'system', label: '系统提示 System', tokens: nonNegative(breakdown.systemTokens) },
+          { key: 'tools', label: '工具 schema Tools', tokens: nonNegative(breakdown.toolsTokens) },
+          { key: 'messages', label: '消息 Messages', tokens: nonNegative(breakdown.messageTokens) },
+        );
+      } else if (current !== undefined) {
+        parts.push(
+          { key: 'system', label: '系统提示 System', tokens: nonNegative(current.system) },
+          { key: 'tools', label: '工具 schema Tools', tokens: nonNegative(current.tools) },
+          {
+            key: 'messages',
+            label: '消息 Messages',
+            tokens: nonNegative(current.user) + nonNegative(current.assistant) + nonNegative(current.tool),
+          },
+          { key: 'injected', label: '注入 Inject/Skill', tokens: nonNegative(current.inject) + nonNegative(current.skill) },
+        );
+      }
+      const accounted = parts.reduce((sum, part) => sum + part.tokens, 0);
+      // Pressure can include material the three official buckets do not name.
+      // Show that remainder instead of silently shrinking the bar.
+      if (used > accounted && used - accounted > 1) {
+        parts.push({ key: 'other', label: '其他 Other', tokens: used - accounted });
+      }
+
+      const hit = nonNegative(usage?.cacheReadTokens);
+      const inputSide = hit + nonNegative(usage?.inputTokens) + nonNegative(usage?.cacheWriteTokens);
+      const counts = timeline?.counts !== undefined && timeline.counts !== null && typeof timeline.counts === 'object' ? timeline.counts : undefined;
+      const events = Array.isArray(timeline?.events) ? timeline.events : [];
+      const compactions = nonNegative(counts?.compactions) ||
+        events.filter((event) => event?.kind === 'compaction').length;
+      const prunes = nonNegative(counts?.prunes) ||
+        events.filter((event) => event?.kind === 'prune').length;
+
+      const hasTimeline = current !== undefined;
+      const hasPressure = pressure !== undefined || breakdown !== undefined;
+      if (!hasTimeline && !hasPressure && used === 0 && accounted === 0) return undefined;
+
+      return {
+        sessionId,
+        used,
+        window,
+        ratio,
+        level: contextLevel(ratio),
+        parts: parts.filter((part) => part.tokens > 0 || part.key === 'messages'),
+        accounted,
+        hit,
+        inputSide,
+        compactions,
+        prunes,
+        turns: nonNegative(counts?.turns),
+        steps: nonNegative(counts?.steps),
+        reserve: nonNegative(timeline?.maxOutputTokens),
+        model: typeof timeline?.model === 'string' ? timeline.model : undefined,
+        hasTimeline,
+        hasPressure,
+        source: hasTimeline ? 'dsh-context' : hasPressure ? 'projection' : 'tokens',
+      };
     }
 
     /**
@@ -909,7 +1060,7 @@ window.__ModuleLoader__.load({
    around a local origin so the keyframes can throw it upward. */
 .${PREFIX}-spout{transform-box:view-box;transform-origin:12.45px 2.9px;opacity:0}
 .${PREFIX}-lyr[data-mood="done"] .${PREFIX}-spout{animation:${PREFIX}-spout 1.5s cubic-bezier(.2,.7,.3,1) 1}
-.${PREFIX}-badge{position:absolute;right:2px;bottom:12px;min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:var(--dsw-alias-brand-primary,#4d6bfe);color:#fff;font-size:11px;line-height:18px;text-align:center;font-variant-numeric:tabular-nums;box-shadow:0 2px 6px rgba(0,0,0,.22)}
+.${PREFIX}-badge{position:absolute;right:2px;bottom:12px;z-index:2;min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:#4d6bfe;color:#fff;font-size:11px;line-height:18px;text-align:center;font-variant-numeric:tabular-nums;box-shadow:0 2px 6px rgba(0,0,0,.28)}
 @keyframes ${PREFIX}-bob{0%,100%{transform:translateY(0) rotate(-1.2deg)}50%{transform:translateY(-7px) rotate(1.2deg)}}
 @keyframes ${PREFIX}-rise{0%{transform:translateY(6px) scale(.4);opacity:0}25%{opacity:.85}100%{transform:translateY(-26px) scale(1.15);opacity:0}}
 @keyframes ${PREFIX}-spin{to{transform:rotate(360deg)}}
@@ -928,7 +1079,7 @@ window.__ModuleLoader__.load({
    clipped away. An explicit min-height:0 is required, or the auto floor returns. */
 .${PREFIX}-scroll{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}
 .${PREFIX}-dot{width:8px;height:8px;border-radius:50%;background:var(--dsw-alias-state-idle-primary,#9aa4b8);flex:none}
-.${PREFIX}-dot[data-busy="1"]{background:var(--dsw-alias-brand-primary,#4d6bfe);animation:${PREFIX}-pulse 1.4s ease-in-out infinite}
+.${PREFIX}-dot[data-busy="1"]{background:#4d6bfe;animation:${PREFIX}-pulse 1.4s ease-in-out infinite}
 .${PREFIX}-title{font-size:13px;font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .${PREFIX}-status{padding:11px 13px;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.1));display:flex;flex-direction:column;gap:4px;flex:none}
 .${PREFIX}-statusline{font-size:12.5px;font-weight:600;display:flex;align-items:center;gap:7px}
@@ -939,7 +1090,7 @@ window.__ModuleLoader__.load({
 .${PREFIX}-list{padding:5px 0;min-height:220px}
 .${PREFIX}-row{display:flex;gap:9px;padding:8px 13px;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.06))}
 .${PREFIX}-row:last-child{border-bottom:0}
-.${PREFIX}-rail{width:2px;border-radius:1px;background:var(--dsw-alias-brand-primary,#4d6bfe);opacity:.55;flex:none}
+.${PREFIX}-rail{width:2px;border-radius:1px;background:#4d6bfe;opacity:.55;flex:none}
 .${PREFIX}-row[data-error="1"] .${PREFIX}-rail{background:var(--dsw-alias-state-error-primary,#e5484d);opacity:.85}
 .${PREFIX}-rowmain{min-width:0;flex:1;display:flex;flex-direction:column;gap:3px}
 .${PREFIX}-meta{display:flex;align-items:baseline;gap:7px;font-size:11px;color:var(--dsw-alias-label-secondary,#6b7280)}
@@ -952,6 +1103,33 @@ window.__ModuleLoader__.load({
 .${PREFIX}-tag[data-warn="1"]{background:color-mix(in srgb,var(--dsw-alias-state-error-primary,#e5484d) 16%,transparent);color:var(--dsw-alias-state-error-primary,#e5484d)}
 .${PREFIX}-empty{padding:24px 16px;text-align:center;font-size:12px;color:var(--dsw-alias-label-secondary,#6b7280);line-height:1.7}
 .${PREFIX}-acct{border-bottom:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.1));padding:9px 13px 11px;display:flex;flex-direction:column;gap:3px;background:var(--dsw-alias-bg-layer-2,rgba(0,0,0,.02));flex:none}
+/* Context card, fed by the harness' token-meter projections and (when present)
+   dsh-context's contextTimeline. Kept visually lighter than the accounting
+   block: one bar, one legend, four numbers, one jump link. */
+.${PREFIX}-ctx{border-bottom:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.1));padding:9px 13px 11px;display:flex;flex-direction:column;gap:3px;flex:none}
+.${PREFIX}-ctxpct{font-size:12.5px;font-weight:700;font-variant-numeric:tabular-nums;color:var(--ctx-ink,#4d6bfe)}
+.${PREFIX}-ctxpct[data-level="warn"]{--ctx-ink:var(--dsw-alias-state-warn-primary,#b77900)}
+.${PREFIX}-ctxpct[data-level="critical"]{--ctx-ink:var(--dsw-alias-state-error-primary,#e5484d)}
+.${PREFIX}-ctxbar{display:flex;height:8px;border-radius:99px;overflow:hidden;background:var(--dsw-alias-bg-layer-2,rgba(0,0,0,.07));margin:3px 0 5px;gap:1px}
+.${PREFIX}-ctxseg{display:block;height:100%;min-width:0;transition:width .35s ease}
+.${PREFIX}-ctxseg[data-part="system"]{background:#4d6bfe}
+.${PREFIX}-ctxseg[data-part="tools"]{background:#7b61ff}
+.${PREFIX}-ctxseg[data-part="messages"]{background:var(--dsw-alias-state-success-primary,#21a26b)}
+.${PREFIX}-ctxseg[data-part="injected"]{background:var(--dsw-alias-state-warn-primary,#e0a11b)}
+.${PREFIX}-ctxseg[data-part="other"]{background:var(--dsw-alias-state-idle-primary,#9aa4b8)}
+.${PREFIX}-ctxseg[data-part="free"]{flex:1 1 auto;background:transparent}
+.${PREFIX}-ctxlegend{display:flex;flex-wrap:wrap;gap:3px 10px;font-size:10.5px;color:var(--dsw-alias-label-secondary,#6b7280);margin-bottom:2px}
+.${PREFIX}-ctxitem{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}
+.${PREFIX}-ctxdot{width:6px;height:6px;border-radius:2px;background:#9aa4b8;flex:none}
+.${PREFIX}-ctxdot[data-part="system"]{background:#4d6bfe}
+.${PREFIX}-ctxdot[data-part="tools"]{background:#7b61ff}
+.${PREFIX}-ctxdot[data-part="messages"]{background:var(--dsw-alias-state-success-primary,#21a26b)}
+.${PREFIX}-ctxdot[data-part="injected"]{background:var(--dsw-alias-state-warn-primary,#e0a11b)}
+.${PREFIX}-ctxwarn{margin-top:4px;padding:5px 7px;border-radius:6px;font-size:11px;line-height:1.5;background:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#e0a11b) 15%,transparent);color:var(--dsw-alias-label-primary,#1b1b1f);border-left:2px solid var(--dsw-alias-state-warn-primary,#e0a11b)}
+.${PREFIX}-ctxwarn[data-level="critical"]{background:color-mix(in srgb,var(--dsw-alias-state-error-primary,#e5484d) 14%,transparent);border-left-color:var(--dsw-alias-state-error-primary,#e5484d)}
+.${PREFIX}-ctxfoot{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:4px;flex-wrap:wrap}
+.${PREFIX}-ctxfoot .${PREFIX}-note{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 auto}
+.${PREFIX}-ctxfoot .${PREFIX}-btn{flex:none}
 .${PREFIX}-secthead{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11.5px;font-weight:600;margin-bottom:4px}
 .${PREFIX}-secthead .${PREFIX}-note{font-weight:400}
 .${PREFIX}-sectsub{font-size:10.5px;font-weight:600;color:var(--dsw-alias-label-secondary,#6b7280);margin:7px 0 2px;letter-spacing:.02em}
@@ -1126,6 +1304,150 @@ window.__ModuleLoader__.load({
               ? h('span', { className: `${PREFIX}-tag` }, `${glyphs(record.prompt)} glyphs`)
               : null,
           ),
+        ),
+      );
+    }
+
+    /**
+     * The context card: how full the window is, what fills it, and what changed.
+     *
+     * The occupancy number is the harness' own `contextPressure` figure — the
+     * same one the composer's ring warns on — while the composition and the
+     * compaction/prune counters come from dsh-context's `contextTimeline` when
+     * that plugin is installed. With dsh-context present the card also jumps to
+     * its Context Insights page; without it, the official projections still
+     * drive this card, so the pet never depends on a second plugin.
+     */
+    function ContextSection({ context, onOpenInsights }) {
+      if (context === undefined) {
+        return h(
+          'div',
+          { className: `${PREFIX}-ctx` },
+          h(
+            'div',
+            { className: `${PREFIX}-secthead` },
+            h('span', null, '上下文 Context'),
+            h('span', { className: `${PREFIX}-note` }, '等待投影…'),
+          ),
+          h(
+            'div',
+            { className: `${PREFIX}-empty2` },
+            '暂无上下文投影。打开一个会话后，这里会显示窗口占用与构成。',
+            h('br'),
+            h('span', { className: `${PREFIX}-note` }, 'No context projection yet — open a session to populate it.'),
+          ),
+        );
+      }
+
+      const pct = context.ratio === undefined ? undefined : context.ratio * 100;
+      const pctText = pct === undefined ? '—' : `${pct.toFixed(1)}%`;
+      const totalForBar = Math.max(context.used, context.accounted, 1);
+      const share = (value) => (totalForBar > 0 ? `${Math.max(0, Math.min(100, (value / totalForBar) * 100)).toFixed(1)}%` : '0%');
+      const hitRate = context.inputSide > 0 ? Math.round((context.hit / context.inputSide) * 100) : undefined;
+      const row = (label, value, note) =>
+        h(
+          'div',
+          { className: `${PREFIX}-kv` },
+          h('span', { className: `${PREFIX}-k` }, label),
+          h('span', { className: `${PREFIX}-v` }, value),
+          h('span', { className: `${PREFIX}-note` }, note ?? ''),
+        );
+
+      return h(
+        'div',
+        { className: `${PREFIX}-ctx` },
+        h(
+          'div',
+          { className: `${PREFIX}-secthead` },
+          h('span', null, '上下文 Context'),
+          h('span', { className: `${PREFIX}-ctxpct`, 'data-level': context.level }, pctText),
+        ),
+        h(
+          'div',
+          {
+            className: `${PREFIX}-ctxbar`,
+            role: 'img',
+            'aria-label':
+              context.ratio === undefined
+                ? `Context composition ${compact(context.used)} tokens`
+                : `Context ${pctText} full, ${compact(context.used)} of ${compact(context.window)} tokens`,
+          },
+          context.parts.map((part) =>
+            h('span', {
+              key: part.key,
+              className: `${PREFIX}-ctxseg`,
+              'data-part': part.key,
+              style: { width: share(part.tokens) },
+              title: `${part.label} · ${count(part.tokens)} tok · ${share(part.tokens)}`,
+            }),
+          ),
+          h('span', { className: `${PREFIX}-ctxseg`, 'data-part': 'free' }),
+        ),
+        h(
+          'div',
+          { className: `${PREFIX}-ctxlegend` },
+          context.parts.map((part) =>
+            h(
+              'span',
+              { className: `${PREFIX}-ctxitem`, key: part.key },
+              h('i', { className: `${PREFIX}-ctxdot`, 'data-part': part.key }),
+              `${part.label} `,
+              h('b', null, compact(part.tokens)),
+            ),
+          ),
+        ),
+        row(
+          '窗口占用 Occupancy',
+          pctText,
+          context.window > 0 ? `${compact(context.used)} / ${compact(context.window)}` : `${compact(context.used)} tok`,
+        ),
+        context.window > 0
+          ? row('剩余窗口 Headroom', compact(Math.max(0, context.window - context.used)), 'token')
+          : null,
+        context.reserve > 0
+          ? row('预留输出 Reserve', compact(context.reserve), '下一个请求')
+          : null,
+        row(
+          '压缩 Compactions',
+          `${context.compactions} 次`,
+          `${context.prunes} prune · ${context.turns} turns · ${context.steps} steps`,
+        ),
+        hitRate === undefined
+          ? null
+          : row('缓存命中 Cache hit', `${hitRate}%`, `${compact(context.hit)} / ${compact(context.inputSide)}`),
+        context.level === 'warn' || context.level === 'critical'
+          ? h(
+              'div',
+              { className: `${PREFIX}-ctxwarn`, 'data-level': context.level },
+              context.level === 'critical'
+                ? '⚠ 上下文已达到 90%，自动压缩可能随时触发。考虑 /compact 或新开一个会话。'
+                : '上下文接近自动压缩阈值；留意这一轮的输入体积。',
+            )
+          : null,
+        h(
+          'div',
+          { className: `${PREFIX}-ctxfoot` },
+          h(
+            'span',
+            { className: `${PREFIX}-note` },
+            context.source === 'dsh-context'
+              ? `来源 dsh-context${context.model === undefined ? '' : ` · ${context.model}`}`
+              : context.source === 'projection'
+                ? '来源 官方 token 投影'
+                : '来源 会话用量',
+          ),
+          context.hasTimeline && typeof onOpenInsights === 'function'
+            ? h(
+                'button',
+                {
+                  className: `${PREFIX}-btn`,
+                  type: 'button',
+                  onClick: onOpenInsights,
+                  title: '在 dsh-context 的上下文洞察页查看完整构成、趋势与压缩事件',
+                },
+                '上下文洞察 Context Insights ↗',
+              )
+            : null,
         ),
       );
     }
@@ -1341,16 +1663,16 @@ window.__ModuleLoader__.load({
      * The expanded secondary page: what Harness is doing right now, and one row
      * per finished interaction.
      */
-    function Panel({ view, records, onClear, onClose, soundOn, onToggleSound, onPreviewSound, onPickTone, tone, canSound, accounting }) {
+    function Panel({ view, records, onClear, onClose, soundOn, onToggleSound, onPreviewSound, onPickTone, tone, canSound, accounting, context, onOpenInsights }) {
       const active = view.active;
       return h(
         'div',
-        { className: `${PREFIX}-panel`, role: 'dialog', 'aria-label': 'Whale pet interactions' },
+        { className: `${PREFIX}-panel`, role: 'dialog', 'aria-label': 'Whale pet interactions and context' },
         h(
           'div',
           { className: `${PREFIX}-head` },
           h('span', { className: `${PREFIX}-dot`, 'data-busy': view.busy ? '1' : undefined }),
-          h('span', { className: `${PREFIX}-title` }, '🐋 Whale pet · interaction log'),
+          h('span', { className: `${PREFIX}-title` }, '🐋 Whale pet · interactions & context'),
           h(
             'button',
             { className: `${PREFIX}-btn`, type: 'button', onClick: onClose, 'aria-label': 'Collapse' },
@@ -1386,6 +1708,7 @@ window.__ModuleLoader__.load({
                 )
               : null,
           ),
+          h(ContextSection, { context, onOpenInsights }),
           h(AccountSection, accounting),
           h(
             'div',
@@ -1520,6 +1843,8 @@ window.__ModuleLoader__.load({
       const [tone, setTone] = useState(() => readTone());
       const [audioReady, setAudioReady] = useState(true);
       const [localRecords, setLocalRecords] = useState(readStored);
+      /** Re-render heartbeat for Client projections while the panel is open. */
+      const [projectionTick, setProjectionTick] = useState(0);
 
       const lastBusyRef = useRef(undefined);
       const localOpenRef = useRef(new Map());
@@ -1531,6 +1856,15 @@ window.__ModuleLoader__.load({
       });
       const soundRef = useRef(true);
       const moodTimerRef = useRef(undefined);
+      /**
+       * Live inputs for the polling loop. The loop is mounted once, so it reads
+       * the current panel/busy state through this ref instead of re-subscribing
+       * (and restarting the HTTP timer) on every state change.
+       */
+      const pollRef = useRef({ busy: false, open: false });
+      const kickPollRef = useRef(() => {});
+      pollRef.current.busy = hostState.busy === true;
+      pollRef.current.open = open;
 
       // `useSessions` may be absent in a composition without ui-session; the
       // pet then relies on the Host half alone.
@@ -1575,11 +1909,21 @@ window.__ModuleLoader__.load({
         };
       }, []);
 
-      /* --- poll the Host half --- */
+      /* --- poll the Host half, adaptively --- */
       useEffect(() => {
         let stopped = false;
+        let inFlight = false;
         let timer;
+
+        /** The cadence for the NEXT request, decided from live state. */
+        const delay = () => {
+          if (document.hidden) return POLL_MS_HIDDEN;
+          return pollRef.current.open || pollRef.current.busy ? POLL_MS_BUSY : POLL_MS_IDLE;
+        };
+
         const tick = async () => {
+          if (stopped || inFlight) return;
+          inFlight = true;
           try {
             const controller = new AbortController();
             const abort = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -1604,15 +1948,58 @@ window.__ModuleLoader__.load({
             // frozen host snapshot.
             if (!stopped) setHostState((current) => ({ ...current, ok: false, active: [] }));
           } finally {
-            if (!stopped) timer = window.setTimeout(tick, POLL_MS);
+            inFlight = false;
+            window.clearTimeout(timer);
+            if (!stopped) timer = window.setTimeout(tick, delay());
           }
         };
+
+        /** Request an immediate refresh without starting a second loop. */
+        const kick = () => {
+          if (stopped || document.hidden || inFlight) return;
+          window.clearTimeout(timer);
+          tick();
+        };
+        kickPollRef.current = kick;
+
         tick();
+        document.addEventListener('visibilitychange', kick);
+        window.addEventListener('focus', kick);
         return () => {
           stopped = true;
+          kickPollRef.current = () => {};
           window.clearTimeout(timer);
+          document.removeEventListener('visibilitychange', kick);
+          window.removeEventListener('focus', kick);
         };
       }, []);
+
+      // Opening the panel (or work starting) should not wait out an idle tick.
+      useEffect(() => {
+        if (open) kickPollRef.current();
+      }, [open]);
+      useEffect(() => {
+        if (hostState.busy) kickPollRef.current();
+      }, [hostState.busy]);
+
+      // While the panel is open, re-read Client projections on their own cadence:
+      // the Host poll is deliberately slower when idle, and dsh-context's
+      // timeline updates arrive through the projection channel, not that route.
+      useEffect(() => {
+        if (!open) return undefined;
+        const timer = window.setInterval(() => setProjectionTick((value) => value + 1), PROJECTION_TICK_MS);
+        return () => window.clearInterval(timer);
+      }, [open]);
+
+      // Escape closes the panel, matching the dialog's visual affordance.
+      useEffect(() => {
+        if (!open) return undefined;
+        const onKey = (event) => {
+          if (event.key === 'Escape') setOpen(false);
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, [open]);
 
       /* --- client-derived ledger: fold running-state transitions --- */
       const runningIds = useMemo(() => {
@@ -1683,17 +2070,6 @@ window.__ModuleLoader__.load({
        */
       const clientKnows = statusSnapshot instanceof Map;
 
-      // When the Client last saw real work, used to bound how long a claimed
-      // "busy" is believed while the Client's own view says nothing is running.
-      const activityRef = useRef(undefined);
-      const runningCount = runningKey === '' ? 0 : runningKey.split('\u0000').length;
-      useEffect(() => {
-        if (runningCount > 0) activityRef.current = Date.now();
-      }, [runningCount, hostState.now]);
-      /** Grace period before a Host-only "busy" is treated as stale. */
-      const BUSY_GRACE_MS = 6000;
-      void BUSY_GRACE_MS;
-
       /* --- effective view --- *
        * `busy` is the Client's live view whenever the Client has one, because
        * that view comes straight from session status and cannot go stale. The
@@ -1708,11 +2084,9 @@ window.__ModuleLoader__.load({
       const view = useMemo(() => {
         const running = runningKey === '' ? [] : runningKey.split('\u0000');
         const clientBusy = running.length > 0;
-        const hostClaimsBusy = hostState.busy === true;
         const resolved = resolveBusy({ clientKnows, clientBusy, hostBusy: hostState.busy });
         const busy = resolved.busy;
         const lastError = hostState.records.find((record) => typeof record.error === 'string' && record.error !== '');
-        void hostClaimsBusy;
         return {
           busy,
           // The Host still claims work the Client cannot see: the two disagree,
@@ -1733,7 +2107,7 @@ window.__ModuleLoader__.load({
                 };
               }),
         };
-      }, [hostState, runningKey, runningCount, listSnapshot, clientKnows]);
+      }, [hostState, runningKey, listSnapshot, clientKnows]);
 
       const records = useMemo(() => selectRecords(hostState.ok, hostState.records, localRecords), [
         hostState.ok,
@@ -1770,7 +2144,7 @@ window.__ModuleLoader__.load({
        */
       useEffect(() => {
         if (!open) return undefined;
-        const sessions = servicesRef.current;
+        const sessions = servicesRef.current?.get?.('sessions');
         if (sessions === undefined) return undefined;
         const rows = hostState.sessions ?? [];
         if (rows.some((row) => row.totalTokens > 0)) return undefined;
@@ -1833,7 +2207,7 @@ window.__ModuleLoader__.load({
         // running session.
         const active = Object.values(listSnapshot?.byId ?? {}).find((row) => (row?.retainedBy?.mainView ?? 0) > 0)?.sessionId;
         const targetId = active ?? rows[0]?.sessionId ?? runningKey.split('\u0000').filter(Boolean)[0];
-        const clientTokens = readClientTokens(servicesRef.current, targetId);
+        const clientTokens = readClientTokens(servicesRef.current?.get?.('sessions'), targetId);
         if (clientTokens !== undefined) {
           const row = rows.find((entry) => entry.sessionId === targetId);
           return {
@@ -1859,6 +2233,89 @@ window.__ModuleLoader__.load({
         () => priceTokens(accountingSession?.tokens ?? {}, rate),
         [accountingSession, rate],
       );
+
+      /**
+       * The session whose context the panel tracks.
+       *
+       * Occupancy is about the conversation the user is LOOKING AT, not the
+       * session with the most spend: a busy subagent can outspend its parent.
+       * The main-view retain count is the authoritative "currently open in the
+       * center column" signal; a running session, then the accounting row, are
+       * only fallbacks for a page with no conversation selected.
+       */
+      const contextTargetId = useMemo(() => {
+        const main = Object.values(listSnapshot?.byId ?? {}).find((row) => (row?.retainedBy?.mainView ?? 0) > 0)?.sessionId;
+        if (main !== undefined) return main;
+        const running = runningKey.split('\u0000').filter(Boolean)[0];
+        if (running !== undefined) return running;
+        return accountingSession?.sessionId;
+      }, [listSnapshot, runningKey, accountingSession]);
+
+      /**
+       * Live context reading. Re-read when the Host poll lands, the open panel
+       * ticks, or the session changes; all sources are optional projections, so
+       * this stays undefined rather than throwing when none is available.
+       */
+      const context = useMemo(
+        () => readContext(servicesRef.current?.get?.('sessions'), contextTargetId),
+        [contextTargetId, listSnapshot, statusSnapshot, hostState, projectionTick, open],
+      );
+
+      // Load the active session's projections once when the session changes, not
+      // only when the panel opens: the context card should populate from a cold start
+      // too. One delayed tick picks up the projection that arrives after the
+      // asynchronous refresh.
+      useEffect(() => {
+        const sessions = servicesRef.current?.get?.('sessions');
+        if (sessions === undefined || contextTargetId === undefined) return undefined;
+        refreshClientTokens(sessions, contextTargetId);
+        const timer = window.setTimeout(() => setProjectionTick((value) => value + 1), 800);
+        return () => window.clearTimeout(timer);
+      }, [contextTargetId]);
+
+      // Opening the panel is the moment a cold projection is worth loading.
+      // `refreshProjections` is asynchronous, so a second attempt covers the
+      // first read racing the projection's arrival.
+      useEffect(() => {
+        if (!open || contextTargetId === undefined) return undefined;
+        const sessions = servicesRef.current?.get?.('sessions');
+        if (sessions === undefined) return undefined;
+        let stopped = false;
+        let timer;
+        let attempt = 0;
+        const load = () => {
+          if (stopped) return;
+          refreshClientTokens(sessions, contextTargetId);
+          attempt += 1;
+          if (attempt < 2) timer = window.setTimeout(load, 900);
+        };
+        load();
+        return () => {
+          stopped = true;
+          window.clearTimeout(timer);
+        };
+      }, [open, contextTargetId]);
+
+      /**
+       * Jump to dsh-context's Context Insights page.
+       *
+       * `layout.selectPanel` is the public Client navigation action, and
+       * `dsh-context` is the key that plugin registers on the `main` slot. A
+       * deployment without dsh-context simply does nothing: the button is only
+       * rendered when its `contextTimeline` projection proved it is present.
+       */
+      const openContextInsights = useCallback(() => {
+        try {
+          const layout = servicesRef.current?.get?.('layout');
+          if (typeof layout?.selectPanel === 'function') {
+            layout.selectPanel('dsh-context');
+            setOpen(false);
+          }
+        } catch {
+          /* dsh-context is not installed in this profile */
+        }
+      }, []);
+
       const chooseModel = useCallback((next) => {
         setRateModel(next);
         try {
@@ -1980,6 +2437,9 @@ window.__ModuleLoader__.load({
       }, []);
 
       const busy = view.busy;
+      /** Context text reused by the pet's tooltip and accessible label. */
+      const contextPct = context?.ratio === undefined ? undefined : `${(context.ratio * 100).toFixed(1)}%`;
+      const contextTitle = contextPct === undefined ? undefined : `上下文 ${contextPct} · Context ${contextPct}`;
 
       return h(
         React.Fragment,
@@ -2000,6 +2460,8 @@ window.__ModuleLoader__.load({
                 onPickTone: pickTone,
                 tone,
                 canSound: audioReady,
+                context,
+                onOpenInsights: openContextInsights,
                 accounting: {
                   session: accountingSession,
                   records,
@@ -2026,12 +2488,8 @@ window.__ModuleLoader__.load({
               'data-busy': busy ? '1' : '0',
               'data-mood': mood,
               'aria-expanded': open,
-              'aria-label': busy
-                ? 'Whale pet: Harness is working. Open the interaction log.'
-                : mood === 'done'
-                  ? 'Whale pet: work just finished. Open the interaction log.'
-                  : 'Whale pet: idle. Open the interaction log.',
-              title: busy ? 'Harness 工作中 · Working' : mood === 'done' ? 'Harness 刚完成 · Finished' : 'Harness 空闲 · Idle',
+              'aria-label': `${busy ? 'Whale pet: Harness is working.' : mood === 'done' ? 'Whale pet: work just finished.' : 'Whale pet: idle.'}${contextPct === undefined ? '' : ` Context ${contextPct} full.`} Open the interaction log.`,
+              title: [busy ? 'Harness 工作中 · Working' : mood === 'done' ? 'Harness 刚完成 · Finished' : 'Harness 空闲 · Idle', contextTitle].filter(Boolean).join(' · '),
             },
             h(Whale, { busy, mood }),
             records.length > 0 ? h('span', { className: `${PREFIX}-badge` }, records.length > 99 ? '99+' : String(records.length)) : null,
@@ -2049,6 +2507,16 @@ window.__ModuleLoader__.load({
       // so a missing ui-session degrades instead of throwing.
       inject: ['slots'],
       apply(ctx) {
+        /**
+         * Bind this plugin's Client context to the component explicitly.
+         *
+         * The `shell.overlay` standard kit supplies hooks, not a `ctx` prop, yet
+         * the panel needs optional Client services (`sessions`, `layout`) to read
+         * projections and open dsh-context. Handing the component a wrapper that
+         * injects the real context keeps that lookup working in every kit shape
+         * and avoids reaching for a global.
+         */
+        const WhalePetWithContext = (props) => h(WhalePet, { ...props, ctx });
         ctx.effect(
           () =>
             ctx.slots.inject('shell.overlay', () =>
@@ -2059,7 +2527,7 @@ window.__ModuleLoader__.load({
                   order: 40,
                   label: 'Whale pet',
                 },
-                WhalePet,
+                WhalePetWithContext,
               ),
             ),
           'pet-whale: shell.overlay registration',
