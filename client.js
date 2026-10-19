@@ -1060,7 +1060,6 @@ window.__ModuleLoader__.load({
    around a local origin so the keyframes can throw it upward. */
 .${PREFIX}-spout{transform-box:view-box;transform-origin:12.45px 2.9px;opacity:0}
 .${PREFIX}-lyr[data-mood="done"] .${PREFIX}-spout{animation:${PREFIX}-spout 1.5s cubic-bezier(.2,.7,.3,1) 1}
-.${PREFIX}-badge{position:absolute;right:2px;bottom:12px;z-index:2;min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:#4d6bfe;color:#fff;font-size:11px;line-height:18px;text-align:center;font-variant-numeric:tabular-nums;box-shadow:0 2px 6px rgba(0,0,0,.28)}
 @keyframes ${PREFIX}-bob{0%,100%{transform:translateY(0) rotate(-1.2deg)}50%{transform:translateY(-7px) rotate(1.2deg)}}
 @keyframes ${PREFIX}-rise{0%{transform:translateY(6px) scale(.4);opacity:0}25%{opacity:.85}100%{transform:translateY(-26px) scale(1.15);opacity:0}}
 @keyframes ${PREFIX}-spin{to{transform:rotate(360deg)}}
@@ -2492,7 +2491,6 @@ window.__ModuleLoader__.load({
               title: [busy ? 'Harness 工作中 · Working' : mood === 'done' ? 'Harness 刚完成 · Finished' : 'Harness 空闲 · Idle', contextTitle].filter(Boolean).join(' · '),
             },
             h(Whale, { busy, mood }),
-            records.length > 0 ? h('span', { className: `${PREFIX}-badge` }, records.length > 99 ? '99+' : String(records.length)) : null,
           ),
         ),
       );
