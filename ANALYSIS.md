@@ -3,11 +3,11 @@
 | 项 | 值 |
 |---|---|
 | 被分析版本 | `dsh-whale-pet@1.0.0`（profile 中由 GitHub tarball 安装） |
-| 优化版本 | `1.1.3`（移除鲸鱼角标） |
+| 优化版本 | `1.2.0`（权限紧急提示） |
 | 对照插件 | `dsh-context@0.73.3` |
 | 运行环境 | DeepSeek Harness Web GUI（profile `desktop`） |
-| 改动范围 | 仅 Browser 半侧 `client.js`（Host `index.js` 未改） |
-| 生效方式 | 安装后刷新页面；Host 无需重启 |
+| 改动范围 | Host `index.js`（待授权折叠）+ Browser `client.js`（上下文面板 / 紧急音 / 轮询） |
+| 生效方式 | 刷新页面；本次 Host 改动需重启一次 DSH |
 
 ---
 
@@ -17,9 +17,9 @@
 
 本次优化把 `dsh-context` 的上下文洞察能力接到宠物身上，形成一条连贯的叙事：
 
-> **鲸鱼的状态 = Harness 在不在工作；点开面板 = 这些工作花了多少、上下文被什么占满、要不要压缩。**
+> **鲸鱼的状态 = Harness 在不在工作；需要授权 = 紧急声音 + 琥珀光晕；点开面板 = 这些工作花了多少、上下文被什么占满、要不要压缩。**
 
-同时修掉了原实现中一个会让“浏览器投影兜底”永远失效的服务定位 bug，并把固定 1.5 s 轮询改成自适应节奏。
+同时修掉了原实现中一个会让“浏览器投影兜底”永远失效的服务定位 bug，把固定 1.5 s 轮询改成自适应节奏，并为“需要授权”补上独立的紧急声音提醒（v1.2.0）。
 
 ---
 
@@ -109,6 +109,35 @@ ctx.get('layout').selectPanel('dsh-context')
 
 面板、占用、三段构成、缓存命中仍然工作，只是没有压缩计数和洞察跳转。**不会因为少装一个插件而退化成一个装饰品。**
 
+### 3.6 权限提醒（v1.2.0）
+
+DSH 的审批落成两条 durable session event：
+
+- `approval/asked` → `{ id, toolName, callId?, reason? }`
+- `approval/decided` → `{ id, outcome }`
+
+Host 半侧在已有的 `session/event` 折叠里维护一个 `approvals` Map（按 `sessionId + id`），`approval/decided` 删除，`session/disposed` 清空该会话，快照增加：
+
+```jsonc
+{
+  "version": 4,
+  "approvals": [
+    { "id": "...", "sessionId": "...", "label": "...", "toolName": "bash",
+      "reason": "...", "askedAt": 1730000000000 }
+  ],
+  "approvalCount": 1
+}
+```
+
+Browser 半侧：
+
+- 待授权集合变化时立即播放**固定**的紧急双音（B5/E5 交替 + 高音收尾，方波），不受用户选择的完成音色影响；
+- 未处理期间每 12 秒重响一次；页面重新可见时补响一次；静音开关仍生效；
+- 鲸鱼光晕变琥珀并闪烁（仍是软光晕，不是外圈）；
+- 面板顶部列出待授权工具、原因与会话标签。
+
+这个功能必须改 Host，所以**安装这一版后要重启一次 DSH**；重启后 `GET /pet-whale/state` 的 `version` 变为 `4`。
+
 ---
 
 ## 4. 性能优化
@@ -125,7 +154,7 @@ ctx.get('layout').selectPanel('dsh-context')
 - 面板打开期间每 1.2 s 只重读**内存中的 projection**，不额外走 HTTP；HTTP 轮询仍按上面的节奏。
 - `readProjection` / `readContext` 是纯读，无缓存写入、无会话修改、无遥测。
 - 删除死代码后，`view` 的依赖数组不再包含未使用的 `runningCount`。
-- Host `index.js` 未改，避免“必须重启 DSH”的验证成本。
+- Host 只新增待授权折叠（`approval/asked|decided`），不参与轮询与计价；其余 Host 逻辑未改。
 
 ---
 
@@ -135,14 +164,19 @@ ctx.get('layout').selectPanel('dsh-context')
 |---|---|
 | 轮询节奏 / 阈值常量 | `client.js:43` 起 |
 | 通用 projection 读取 | `client.js:213` |
-| 上下文读取与降级 | `client.js:329` |
-| Context 卡片 | `client.js:1333` |
-| 自适应轮询 | `client.js:1924` |
-| 服务定位修复 | `client.js:2141` 起 |
-| 槽位上下文注入 | `client.js:2536` |
-| 主视图会话选择 | `client.js:2258` |
-| 投影补载 | `client.js:2280` 起 |
-| 洞察页跳转 | `client.js:2319` |
+| 上下文读取与降级 | `client.js:331` |
+| 紧急音音符 / `audio.urgent()` | `client.js:825` 起 / `client.js:1046` |
+| Context 卡片 | `client.js:1354` |
+| 授权面板行 / 琥珀光晕 | `client.js:1743` / `client.js:1086` |
+| 自适应轮询 | `client.js:1969` |
+| 服务定位修复 | `client.js:2196` 起 |
+| 待授权集合 / 重响 | `client.js:2180` / `client.js:2410` 起 |
+| 主视图会话选择 | `client.js:2313` |
+| 投影补载 | `client.js:2335` 起 |
+| 洞察页跳转 | `client.js:2374` |
+| 槽位上下文注入 | `client.js:2624` |
+| Host 待授权折叠 | `index.js:347` / `529` 起 |
+| Host 快照 `approvals` | `index.js:692` 起 |
 
 ---
 
@@ -158,10 +192,12 @@ ctx.get('layout').selectPanel('dsh-context')
 | `ContextSection` 渲染断言 | 4.2%、`42.0k / 1.0M`、`2 次` 压缩、75% 缓存命中、95% 警告、空状态均出现 |
 | `WhalePet` 初始渲染断言 | title 含 `4.2%`；按钮不再渲染任何外圈节点 |
 | `Panel` 渲染断言 | Context 卡片出现在 Usage 卡片之前，内容完整 |
-| `install_bundle` | `application: applied`，安装时 `1.1.0`；当前 link 版本 `1.1.2` |
+| Host 审批折叠桩测试 | `approval/asked` → 1 条；重复 ask 不膨胀；`approval/decided` → 0；`session/disposed` 清空；快照 `version: 4` |
+| 授权面板渲染断言 | `需要授权`、工具名 `bash`、原因、会话标签均出现 |
+| `install_bundle` | `application: applied`，安装时 `1.1.0`；当前 link 版本 `1.2.0` |
 | `Config.listConfigs name=dsh-whale-pet` | 存在 `include:pet-whale` |
 | `Slots.listSubTree root=shell.overlay` | 占用者 `pet-whale`，`active: true` |
-| `GET /pet-whale/state` | `200`，`ok: true`，`version: 3` |
+| `GET /pet-whale/state` | 当前运行进程仍为 `version: 3`；**重启 DSH 后应为 `4`** |
 | 用户截图像素分析 | 白色胶囊位于 `(159..186, 156..171)`，颜色 `#f9fafb` = `--dsw-static-neutral-bluish-50`；灰色圆环是该色的 16% 混合。确认根因是主题 token 误用。v1.1.2 已移除整个外圈。 |
 
 ### 6.2 未做 / 限制
@@ -169,6 +205,8 @@ ctx.get('layout').selectPanel('dsh-context')
 - **没有在真实页面上做 DOM / 截图控制**：浏览器端没有可用的 DOM 截图 / 点击控制；本次通过用户截图做了像素级根因定位，组件树与颜色值正确，但修复后的实际观感仍需刷新后目视确认。
 - **没有读取到实时的 projection 值**：验证用的是按已确认 schema 构造的桩数据；真实 dsh-context 投影是否存在，需要刷新后看面板 Context 卡片是否出现。
 - **“上下文洞察”跳转按钮没有真实点击验证**：`layout.selectPanel('dsh-context')` 的 key 已通过 `Slots` 确认，但点击后的页面切换未在浏览器里执行。
+- **权限紧急音没有真实试听**：音符、音色与调度走的是既有 `renderChime` 路径，`audio.urgent()` 已接入；实际音量与“紧急感”需要重启后在浏览器里确认。
+- **Host 审批折叠尚未在真实进程重启后验证**：桩测试覆盖了 asked/decided/重复/disposed，但当前线上 `/pet-whale/state` 仍是旧进程的 `version: 3`；重启后才会变成 `4`。
 
 ---
 
@@ -179,6 +217,7 @@ ctx.get('layout').selectPanel('dsh-context')
 3. **上下文趋势**：dsh-context 的 `contextTimeline.detailRev` 后面还有详细事件 / 请求数据；若愿意走它的 detail 路由，可以在面板里加一条迷你趋势条或最近压缩事件。当前只用了 slim head 的 `counts`，没有额外拉详情。
 4. **可选的压缩提醒音**：90% 阈值目前只有视觉脉冲；若用户希望，可在每会话首次跨过 90% 时加一声轻提示（需要防重复与静音开关）。
 5. **真实浏览器回归**：刷新后检查明暗主题、窄屏 390 px 面板、Context 卡片在 0.1% / 80% / 95% 三档的观感。
+6. **重启后实测权限提醒**：触发一次需要审批的工具调用，确认紧急音、12 秒重响、页面恢复补响、面板待授权行与琥珀光晕都按预期工作。
 
 ---
 

@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "鲸鱼宠物",
-    "description": "角落里的 DeepSeek 蓝色鲸鱼：Harness 工作时它会游动，任务完成后会发出提示音，点击可查看每一次交互记录、上下文构成与花费（上下文数据与 dsh-context 同源）。"
+    "description": "角落里的 DeepSeek 蓝色鲸鱼：Harness 工作时它会游动，需要授权时会发出紧急提示音，任务完成后会发出提示音，点击可查看每一次交互记录、上下文构成与花费（上下文数据与 dsh-context 同源）。"
   }
 }

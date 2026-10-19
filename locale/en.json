@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Whale pet",
-    "description": "An animated DeepSeek blue-whale companion in the corner of the app: it dances while Harness works, chimes when work finishes, and opens a panel with one row per interaction plus the live context composition fed by dsh-context."
+    "description": "An animated DeepSeek blue-whale companion in the corner of the app: it dances while Harness works, sounds an urgent alarm when an approval is pending, chimes when work finishes, and opens a panel with one row per interaction plus the live context composition fed by dsh-context."
   }
 }

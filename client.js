@@ -45,6 +45,8 @@ window.__ModuleLoader__.load({
     const POLL_MS_HIDDEN = 20000;
     /** Re-read Client projections while the panel is open, independent of polling. */
     const PROJECTION_TICK_MS = 1200;
+    /** How often a still-pending permission request re-rings. */
+    const APPROVAL_REPEAT_MS = 12000;
     const REQUEST_TIMEOUT_MS = 4000;
     const LOCAL_RECORD_LIMIT = 120;
     const STORAGE_KEY = 'dsh.pet.whale.records.v1';
@@ -819,6 +821,20 @@ window.__ModuleLoader__.load({
     };
     /** Default tone, used until the user picks another. */
     const DEFAULT_TONE = 'bright';
+    /**
+     * The permission alarm. Deliberately fixed rather than part of `TONES`: this
+     * is a safety cue, so it must not become the quiet "Click" because that was
+     * the selected completion sound. A fast high/low square alternation reads as
+     * an alarm even at low volume, and the last rising note resolves it.
+     */
+    const URGENT_NOTES = [
+      { frequency: 987.77, duration: 0.16, gain: 1, type: 'square' },
+      { frequency: 659.25, duration: 0.16, gain: 1, type: 'square' },
+      { frequency: 987.77, duration: 0.16, gain: 1, type: 'square' },
+      { frequency: 659.25, duration: 0.16, gain: 1, type: 'square' },
+      { frequency: 1318.51, duration: 0.46, gain: 0.92, type: 'square' },
+    ];
+    const URGENT_VOICING = { type: 'square', gain: 1.3, octave: 1.5, shimmer: 0.12, attack: 0.004 };
     /** Persisted tone choice. */
     const TONE_KEY = `${STORAGE_KEY}.tone`;
 
@@ -1019,6 +1035,17 @@ window.__ModuleLoader__.load({
         const tone = this.tone();
         return this.play(tone.start, tone);
       },
+      /**
+       * The permission cue.
+       *
+       * It uses a fixed urgent pattern instead of the selected completion tone:
+       * an approval waiting on a human is a different class of event, and the
+       * user may well have chosen a quiet completion sound. The output stage is
+       * shared, so this still respects the global mute switch and limiter.
+       */
+      urgent() {
+        return this.play(URGENT_NOTES, URGENT_VOICING);
+      },
     };
 
     // Exposed only under an explicit flag, so the shipping bundle exports nothing
@@ -1026,6 +1053,7 @@ window.__ModuleLoader__.load({
     if (globalThis.__PET_WHALE_TEST__ === true) {
       globalThis.__PET_WHALE_AUDIO__ = {
         renderVoice, renderChime, chimeOutput, TONES, DEFAULT_TONE, VOICE_GAIN, CHIME_MASTER, NOTE_GAP,
+        URGENT_NOTES, URGENT_VOICING,
       };
     }
 
@@ -1053,6 +1081,9 @@ window.__ModuleLoader__.load({
    unmistakable even with sound muted or the tab in the background. */
 .${PREFIX}-lyr[data-mood="done"] .${PREFIX}-glow{opacity:.95;animation:${PREFIX}-flash .9s ease-out 2}
 .${PREFIX}-lyr[data-mood="error"] .${PREFIX}-glow{opacity:.9;animation:${PREFIX}-flash 1.1s ease-out 1;fill:var(--dsw-alias-state-error-primary,#e5484d)}
+/* A pending permission is a blocking state: the halo blinks amber until it is
+   answered. This is a soft glow, not a ring, so the whale stays clean. */
+.${PREFIX}-lyr[data-approval="1"] .${PREFIX}-glow{opacity:.9;animation:${PREFIX}-flash 1.1s ease-out infinite;fill:var(--dsw-alias-state-warn-primary,#e0a11b)}
 /* Completion spout. It leaves the blowhole, which is the V-notch in the back
    profile: measured on the outline, x 12.45 is where the back drops from y 0.66
    to y 2.96, and 2.96 is the notch vertex. Emitting from the high arm instead put
@@ -1082,6 +1113,9 @@ window.__ModuleLoader__.load({
 .${PREFIX}-title{font-size:13px;font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .${PREFIX}-status{padding:11px 13px;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.1));display:flex;flex-direction:column;gap:4px;flex:none}
 .${PREFIX}-statusline{font-size:12.5px;font-weight:600;display:flex;align-items:center;gap:7px}
+.${PREFIX}-approval{margin-top:4px;padding:5px 7px;border-radius:6px;border-left:2px solid var(--dsw-alias-state-warn-primary,#e0a11b);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#e0a11b) 14%,transparent);display:flex;flex-direction:column;gap:3px}
+.${PREFIX}-approvalrow{font-size:11px;line-height:1.45;color:var(--dsw-alias-label-primary,#1b1b1f);word-break:break-word}
+.${PREFIX}-approvalrow b{color:var(--dsw-alias-state-warn-primary,#e0a11b)}
 .${PREFIX}-sub{font-size:11.5px;color:var(--dsw-alias-label-secondary,#6b7280);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 // The record list is a plain block inside the scrolling body. A moderate floor
 // keeps a row or two readable when the sections above are tall, without letting
@@ -1706,6 +1740,28 @@ window.__ModuleLoader__.load({
                   '主机端仍报告忙碌，但浏览器已看不到运行中的会话，此处以浏览器为准。',
                 )
               : null,
+            view.approvalCount > 0
+              ? h(
+                  'div',
+                  { className: `${PREFIX}-approval` },
+                  h(
+                    'div',
+                    { className: `${PREFIX}-approvalrow` },
+                    `⚠ 需要授权 · ${view.approvalCount} pending · Approval needed`,
+                  ),
+                  view.approvals.map((approval) =>
+                    h(
+                      'div',
+                      { className: `${PREFIX}-approvalrow`, key: `${approval.sessionId}:${approval.id}` },
+                      h('b', null, approval.toolName ?? 'tool'),
+                      approval.reason !== undefined && approval.reason !== '' ? ` · ${approval.reason}` : '',
+                      approval.label !== undefined && approval.label !== ''
+                        ? h('span', { className: `${PREFIX}-note` }, ` · ${approval.label}`)
+                        : null,
+                    ),
+                  ),
+                )
+              : null,
           ),
           h(ContextSection, { context, onOpenInsights }),
           h(AccountSection, accounting),
@@ -1835,7 +1891,7 @@ window.__ModuleLoader__.load({
       const useSessions = props.useSessions;
       const useSessionStatus = props.useSessionStatus;
 
-      const [hostState, setHostState] = useState({ ok: false, busy: false, active: [], records: [], feed: [], sessions: [], balance: undefined, now: undefined });
+      const [hostState, setHostState] = useState({ ok: false, busy: false, active: [], records: [], feed: [], sessions: [], approvals: [], balance: undefined, now: undefined });
       const [open, setOpen] = useState(false);
       const [mood, setMood] = useState('calm');
       const [soundOn, setSoundOn] = useState(true);
@@ -1855,6 +1911,8 @@ window.__ModuleLoader__.load({
       });
       const soundRef = useRef(true);
       const moodTimerRef = useRef(undefined);
+      /** Timestamp of the last permission alarm, for the repeat interval. */
+      const approvalCueAtRef = useRef(0);
       /**
        * Live inputs for the polling loop. The loop is mounted once, so it reads
        * the current panel/busy state through this ref instead of re-subscribing
@@ -1938,6 +1996,7 @@ window.__ModuleLoader__.load({
               records: Array.isArray(body?.records) ? body.records : [],
               feed: Array.isArray(body?.feed) ? body.feed : [],
               sessions: Array.isArray(body?.sessions) ? body.sessions : [],
+              approvals: Array.isArray(body?.approvals) ? body.approvals : [],
               balance: body?.balance !== null && typeof body?.balance === 'object' ? body.balance : undefined,
               now: typeof body?.now === 'number' ? body.now : undefined,
             });
@@ -1945,7 +2004,7 @@ window.__ModuleLoader__.load({
             // Keep the last known view but mark the Host half unreachable, so the
             // ledger falls back to the client-derived one instead of showing a
             // frozen host snapshot.
-            if (!stopped) setHostState((current) => ({ ...current, ok: false, active: [] }));
+            if (!stopped) setHostState((current) => ({ ...current, ok: false, active: [], approvals: [] }));
           } finally {
             inFlight = false;
             window.clearTimeout(timer);
@@ -2086,12 +2145,15 @@ window.__ModuleLoader__.load({
         const resolved = resolveBusy({ clientKnows, clientBusy, hostBusy: hostState.busy });
         const busy = resolved.busy;
         const lastError = hostState.records.find((record) => typeof record.error === 'string' && record.error !== '');
+        const approvals = Array.isArray(hostState.approvals) ? hostState.approvals : [];
         return {
           busy,
           // The Host still claims work the Client cannot see: the two disagree,
           // and the Client's answer is the one shown.
           disagrees: resolved.disagrees,
           status: busy ? 'running' : lastError !== undefined && Date.now() - (lastError.endedAt ?? 0) < 8000 ? 'error' : 'idle',
+          approvals,
+          approvalCount: approvals.length,
           // The Host's richer `active` detail is used only while `busy` is true,
           // so a stale Host entry cannot outlive the status above it.
           active: busy && hostState.active.length > 0
@@ -2113,6 +2175,12 @@ window.__ModuleLoader__.load({
         hostState.records,
         localRecords,
       ]);
+
+      /** Stable identity of the pending-permission set, used to ring only on change. */
+      const approvalKey = useMemo(
+        () => view.approvals.map((approval) => `${approval.sessionId ?? ''}:${approval.id ?? ''}`).sort().join('\u0000'),
+        [view.approvals],
+      );
 
       /* --- cost accounting: one rate table, one price rule --- */
       const [rateModel, setRateModel] = useState(() => readRates().model);
@@ -2352,6 +2420,42 @@ window.__ModuleLoader__.load({
         if (previousBusy === false && busy && soundRef.current) audio.start();
       }, [view.busy]);
 
+      /**
+       * Permission alarm.
+       *
+       * A pending approval is a blocking state: the turn cannot continue until a
+       * human answers. It gets its own fixed urgent pattern, rings immediately
+       * when the set changes, and repeats every {@link APPROVAL_REPEAT_MS} while
+       * it stays unresolved. The repeat is timer-driven rather than per-poll so
+       * a 5 s idle poll does not turn into a 5 s alarm.
+       */
+      useEffect(() => {
+        if (approvalKey === '' || !soundOn) {
+          approvalCueAtRef.current = 0;
+          return undefined;
+        }
+        const ring = () => {
+          if (!soundOn) return;
+          audio.unlock();
+          audio.urgent();
+          approvalCueAtRef.current = Date.now();
+        };
+        ring();
+        const timer = window.setInterval(() => {
+          if (Date.now() - approvalCueAtRef.current >= APPROVAL_REPEAT_MS) ring();
+        }, 1000);
+        // A hidden tab throttles timers; re-ring as soon as the page is visible
+        // again so the permission is not silently waiting behind another window.
+        const onVisible = () => {
+          if (!document.hidden) ring();
+        };
+        document.addEventListener('visibilitychange', onVisible);
+        return () => {
+          window.clearInterval(timer);
+          document.removeEventListener('visibilitychange', onVisible);
+        };
+      }, [approvalKey, soundOn]);
+
       /** Play one cue outcome, or only fix the mood when it already rang. */
       const applyCue = useCallback((decision, failed) => {
         if (decision === 'silent') return;
@@ -2436,6 +2540,8 @@ window.__ModuleLoader__.load({
       }, []);
 
       const busy = view.busy;
+      const approvalCount = view.approvalCount;
+      const approvalTitle = approvalCount > 0 ? `需要授权 ${approvalCount} · Approval needed` : undefined;
       /** Context text reused by the pet's tooltip and accessible label. */
       const contextPct = context?.ratio === undefined ? undefined : `${(context.ratio * 100).toFixed(1)}%`;
       const contextTitle = contextPct === undefined ? undefined : `上下文 ${contextPct} · Context ${contextPct}`;
@@ -2486,9 +2592,10 @@ window.__ModuleLoader__.load({
               onClick: onClickPet,
               'data-busy': busy ? '1' : '0',
               'data-mood': mood,
+              'data-approval': approvalCount > 0 ? '1' : '0',
               'aria-expanded': open,
-              'aria-label': `${busy ? 'Whale pet: Harness is working.' : mood === 'done' ? 'Whale pet: work just finished.' : 'Whale pet: idle.'}${contextPct === undefined ? '' : ` Context ${contextPct} full.`} Open the interaction log.`,
-              title: [busy ? 'Harness 工作中 · Working' : mood === 'done' ? 'Harness 刚完成 · Finished' : 'Harness 空闲 · Idle', contextTitle].filter(Boolean).join(' · '),
+              'aria-label': `${approvalCount > 0 ? `Approval needed for ${approvalCount} request${approvalCount === 1 ? '' : 's'}.` : ''}${busy ? 'Whale pet: Harness is working.' : mood === 'done' ? 'Whale pet: work just finished.' : 'Whale pet: idle.'}${contextPct === undefined ? '' : ` Context ${contextPct} full.`} Open the interaction log.`,
+              title: [approvalTitle, busy ? 'Harness 工作中 · Working' : mood === 'done' ? 'Harness 刚完成 · Finished' : 'Harness 空闲 · Idle', contextTitle].filter(Boolean).join(' · '),
             },
             h(Whale, { busy, mood }),
           ),

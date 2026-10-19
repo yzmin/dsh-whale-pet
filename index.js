@@ -4,7 +4,8 @@
  * The pet's visible behaviour lives in the browser (`./client.js`). This half
  * only answers one question the browser cannot answer reliably: *what has
  * Harness actually been doing?* It folds the Host's own lifecycle events —
- * `session/event`, `agent/status`, `agent/error` — into a bounded, plain-JSON
+ * `session/event` (including `approval/asked` / `approval/decided`),
+ * `api-session/status`, `api-session/error` — into a bounded, plain-JSON
  * record set, and publishes it over one loopback HTTP route.
  *
  * Design notes:
@@ -60,6 +61,8 @@ const ASSET_TYPES = new Map([
  * loadable from a bare profile link, where only Node builtins resolve.
  */
 const MAX_RECORDS = 80;
+/** Bounded pending-approval ledger; permissions are rare, so this is generous. */
+const MAX_APPROVALS = 20;
 
 /**
  * Listener options for every lifecycle subscription below.
@@ -333,6 +336,15 @@ export function apply(ctx) {
    * so it measures the session rather than this plugin's uptime.
    */
   const sessionTotals = new Map();
+  /**
+   * Pending approval requests, keyed by `sessionId + request id`.
+   *
+   * `approval/asked` and `approval/decided` are durable session events, so the
+   * same `{ global: true }` subscription that folds turns also sees permissions
+   * without touching the approval answerer chain. The map is bounded and cleared
+   * for a disposed session; a decision removes its own row.
+   */
+  const approvals = new Map();
 
   /** Read or create the per-session accounting row. */
   const totalsOf = (sessionId) => {
@@ -514,6 +526,35 @@ export function apply(ctx) {
         episode.tools += 1;
         break;
       }
+      case 'approval/asked': {
+        // A permission request is waiting for a human answer. Keep the tool and
+        // reason so the pet can say what needs attention, not only that one exists.
+        const id = data?.id;
+        if (typeof id !== 'string' && typeof id !== 'number') break;
+        const key = `${sessionId}\u0000${String(id)}`;
+        const toolName = clip(typeof data?.toolName === 'string' ? data.toolName : 'tool', 80);
+        approvals.set(key, {
+          id: String(id),
+          sessionId,
+          toolName,
+          reason: clip(typeof data?.reason === 'string' ? data.reason : '', TEXT_LIMIT),
+          askedAt: typeof now === 'number' && now > 0 ? now : Date.now(),
+        });
+        if (approvals.size > MAX_APPROVALS) {
+          // Map iteration is insertion order: drop the oldest request only.
+          const oldest = approvals.keys().next().value;
+          if (oldest !== undefined) approvals.delete(oldest);
+        }
+        feed_('approval', `需要授权 · ${toolName}`, sessionId);
+        break;
+      }
+      case 'approval/decided': {
+        const id = data?.id;
+        if (typeof id === 'string' || typeof id === 'number') {
+          approvals.delete(`${sessionId}\u0000${String(id)}`);
+        }
+        break;
+      }
       case 'session/title': {
         const title = typeof data?.title === 'string' ? data.title.trim() : '';
         if (title !== '') labels.set(sessionId, clip(title, 80));
@@ -555,6 +596,9 @@ export function apply(ctx) {
     running.delete(sessionId);
     labels.delete(sessionId);
     open.delete(sessionId);
+    for (const [key, approval] of approvals) {
+      if (approval.sessionId === sessionId) approvals.delete(key);
+    }
     // Deliberately KEEP `sessionTotals`: a disposed session's tokens were really
     // spent, and the accounting should outlive the live registry entry.
   }, GLOBAL);
@@ -643,14 +687,28 @@ export function apply(ctx) {
     }
     sessions.sort((left, right) => (right.lastEventAt ?? 0) - (left.lastEventAt ?? 0));
 
+    // Pending permissions, newest first. Built in its own guarded row so one
+    // malformed approval costs its own entry, not the whole snapshot.
+    const approvalRows = [];
+    for (const approval of approvals.values()) {
+      try {
+        approvalRows.push({ ...approval, label: labelFor(approval.sessionId) });
+      } catch (error) {
+        warn(ctx, `pet-whale: skipped an approval row — ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    approvalRows.sort((left, right) => right.askedAt - left.askedAt);
+
     return {
-      version: 3,
+      version: 4,
       now,
       busy: active.length > 0,
       active,
       records: records.slice(0, MAX_RECORDS),
       feed: feed.slice(0, 20),
       sessions,
+      approvals: approvalRows,
+      approvalCount: approvalRows.length,
       grandTotalTokens: sessions.reduce((sum, row) => sum + row.totalTokens, 0),
       // Cached: the reading itself refreshes on its own slow timer so a 1.5 s
       // poll never turns into a Platform request.

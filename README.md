@@ -5,6 +5,7 @@
 - **动效** — 空闲时轻轻浮动;工作时游动加快、气泡上升、光晕脉动、虚线工作环转动。
 - **状态** — 实时显示 Harness 是否在工作,以及正在处理哪个会话。
 - **音效** — 工作完成时播放 `assets/tone.wav`;失败时播放该音色的下行合成版本;开始工作时轻响一声。
+- **权限提醒** — 需要授权(`approval/asked`)时播放固定的紧急高 / 低双音警报,不受当前完成音色影响;未处理期间每 12 秒重响一次,页面重新可见时也会补响;面板顶部列出待授权的工具与原因。
 - **用量与花费** — 点击鲸鱼展开面板,显示本会话的 token 分解(缓存命中 / 未命中 / 缓存写入 / 输出)、按官方费率算出的人民币(或美元)金额、会话时长、账户余额,以及每一次交互的明细。
 - **交互记录** — 每条记录含提示词、回复摘要、工具 / 轮次 / 步骤计数、耗时与费用。
 - **干净的本体** — 宠物只保留鲸鱼本身,不显示交互计数气泡;记录仍可在面板里查看。
@@ -88,7 +89,7 @@ install_bundle  target: https://example.com/dsh-whale-pet.tgz
 
 - `Config.listConfigs name=dsh-whale-pet` → 应有一条 `include:pet-whale`
 - `Slots.listSubTree root=shell.overlay` → 占用者 `pet-whale`,`active: true`
-- `GET /pet-whale/state` → `{"ok":true,"version":3,…}`
+- `GET /pet-whale/state` → `{"ok":true,"version":4,…}`
 
 ## 改动后如何生效
 
@@ -99,6 +100,8 @@ install_bundle  target: https://example.com/dsh-whale-pet.tgz
 
 原因:加载器每个进程世代只 import 一次 ES 模块,禁用/启用 bundle 只是复用缓存,
 不会重新读取 `index.js`。
+
+本次权限提醒新增了 Host 半侧的 `approval/asked` / `approval/decided` 折叠,因此**这一版升级后需要重启一次 DSH**;之后的纯界面改动仍只需刷新页面。
 
 ## 依赖情况
 
