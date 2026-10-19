@@ -45,8 +45,6 @@ window.__ModuleLoader__.load({
     const POLL_MS_HIDDEN = 20000;
     /** Re-read Client projections while the panel is open, independent of polling. */
     const PROJECTION_TICK_MS = 1200;
-    /** How often a still-pending permission request re-rings. */
-    const APPROVAL_REPEAT_MS = 12000;
     const REQUEST_TIMEOUT_MS = 4000;
     const LOCAL_RECORD_LIMIT = 120;
     const STORAGE_KEY = 'dsh.pet.whale.records.v1';
@@ -1921,8 +1919,8 @@ window.__ModuleLoader__.load({
       });
       const soundRef = useRef(true);
       const moodTimerRef = useRef(undefined);
-      /** Timestamp of the last permission alarm, for the repeat interval. */
-      const approvalCueAtRef = useRef(0);
+      /** Whether an approval was already pending on the previous render. */
+      const previousApprovalRef = useRef(false);
       /**
        * Live inputs for the polling loop. The loop is mounted once, so it reads
        * the current panel/busy state through this ref instead of re-subscribing
@@ -2431,39 +2429,21 @@ window.__ModuleLoader__.load({
       }, [view.busy]);
 
       /**
-       * Permission alarm.
+       * Permission alarm — one ring per pending episode.
        *
-       * A pending approval is a blocking state: the turn cannot continue until a
-       * human answers. It gets its own fixed urgent pattern, rings immediately
-       * when the set changes, and repeats every {@link APPROVAL_REPEAT_MS} while
-       * it stays unresolved. The repeat is timer-driven rather than per-poll so
-       * a 5 s idle poll does not turn into a 5 s alarm.
+       * A pending approval is a blocking state, so it gets a single urgent cue
+       * the first time the set becomes non-empty. It deliberately does NOT repeat
+       * while the request stays unresolved, does not re-ring when the page becomes
+       * visible, and does not ring again for a second request arriving alongside
+       * the first. Once the set empties, a later approval rings again.
        */
       useEffect(() => {
-        if (approvalKey === '' || !soundOn) {
-          approvalCueAtRef.current = 0;
-          return undefined;
-        }
-        const ring = () => {
-          if (!soundOn) return;
-          audio.unlock();
-          audio.urgent();
-          approvalCueAtRef.current = Date.now();
-        };
-        ring();
-        const timer = window.setInterval(() => {
-          if (Date.now() - approvalCueAtRef.current >= APPROVAL_REPEAT_MS) ring();
-        }, 1000);
-        // A hidden tab throttles timers; re-ring as soon as the page is visible
-        // again so the permission is not silently waiting behind another window.
-        const onVisible = () => {
-          if (!document.hidden) ring();
-        };
-        document.addEventListener('visibilitychange', onVisible);
-        return () => {
-          window.clearInterval(timer);
-          document.removeEventListener('visibilitychange', onVisible);
-        };
+        const active = approvalKey !== '';
+        const wasActive = previousApprovalRef.current;
+        previousApprovalRef.current = active;
+        if (!active || wasActive || !soundOn) return;
+        audio.unlock();
+        audio.urgent();
       }, [approvalKey, soundOn]);
 
       /** Play one cue outcome, or only fix the mood when it already rang. */
