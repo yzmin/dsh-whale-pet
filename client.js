@@ -1067,7 +1067,9 @@ window.__ModuleLoader__.load({
 .${PREFIX}-lyr:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#4d6bfe);outline-offset:6px;border-radius:16px}
 .${PREFIX}-lyr[data-busy="1"]{animation-duration:2.1s}
 .${PREFIX}-whale{width:96px;height:88px;display:block;overflow:visible;filter:drop-shadow(0 8px 18px rgba(45,86,220,.28))}
+.${PREFIX}-orbit{transform-box:view-box;animation:${PREFIX}-bobY 3.4s ease-in-out infinite}
 .${PREFIX}-body{transform-box:fill-box;transform-origin:50% 60%;animation:${PREFIX}-bob 3.4s ease-in-out infinite}
+.${PREFIX}-lyr[data-busy="1"] .${PREFIX}-orbit{animation-duration:1.15s}
 .${PREFIX}-lyr[data-busy="1"] .${PREFIX}-body{animation-duration:1.15s}
 .${PREFIX}-edge{pointer-events:none}
 .${PREFIX}-bub{transform-box:fill-box;transform-origin:50% 50%;animation:${PREFIX}-rise 2.9s ease-out infinite;opacity:0}
@@ -1092,6 +1094,9 @@ window.__ModuleLoader__.load({
 .${PREFIX}-spout{transform-box:view-box;transform-origin:12.45px 2.9px;opacity:0}
 .${PREFIX}-lyr[data-mood="done"] .${PREFIX}-spout{animation:${PREFIX}-spout 1.5s cubic-bezier(.2,.7,.3,1) 1}
 @keyframes ${PREFIX}-bob{0%,100%{transform:translateY(0) rotate(-1.2deg)}50%{transform:translateY(-7px) rotate(1.2deg)}}
+/* The orbit follows only the vertical half of the bob: the ring keeps its own
+   spin, and the halo stays concentric instead of inheriting the body's sway. */
+@keyframes ${PREFIX}-bobY{0%,100%{transform:translateY(0)}50%{transform:translateY(-7px)}}
 @keyframes ${PREFIX}-rise{0%{transform:translateY(6px) scale(.4);opacity:0}25%{opacity:.85}100%{transform:translateY(-26px) scale(1.15);opacity:0}}
 @keyframes ${PREFIX}-spin{to{transform:rotate(360deg)}}
 @keyframes ${PREFIX}-pulse{0%,100%{opacity:.28}50%{opacity:.6}}
@@ -1183,7 +1188,7 @@ window.__ModuleLoader__.load({
 .${PREFIX}-btn:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#4d6bfe);outline-offset:1px}
 .${PREFIX}-grow{flex:1}
 .${PREFIX}-note{font-size:10.5px;color:var(--dsw-alias-label-secondary,#6b7280)}
-@media (prefers-reduced-motion:reduce){.${PREFIX}-lyr,.${PREFIX}-body,.${PREFIX}-bub,.${PREFIX}-ring,.${PREFIX}-glow,.${PREFIX}-spout,.${PREFIX}-panel{animation:none!important}}
+@media (prefers-reduced-motion:reduce){.${PREFIX}-lyr,.${PREFIX}-orbit,.${PREFIX}-body,.${PREFIX}-bub,.${PREFIX}-ring,.${PREFIX}-glow,.${PREFIX}-spout,.${PREFIX}-panel{animation:none!important}}
 `;
 
     /** Insert the stylesheet as a React element, so unmounting removes it. */
@@ -1233,9 +1238,26 @@ window.__ModuleLoader__.load({
             h('stop', { offset: '1', stopColor: '#7BA0FF', stopOpacity: '0' }),
           ),
         ),
-        // Behind the body only: a halo, never a fill over it. The body itself
-        // stays fully opaque so nothing shows through the silhouette.
-        h('circle', { className: `${PREFIX}-glow`, cx: '11.5', cy: '9', r: '12.5', fill: `url(#${PREFIX}-glow)` }),
+        // Behind the body only: the halo and the dashed working ring share one
+        // bob wrapper, so the light follows the whale's vertical motion instead
+        // of hanging in place while the body swims through it.
+        h(
+          'g',
+          { className: `${PREFIX}-orbit` },
+          h('circle', { className: `${PREFIX}-glow`, cx: '11.5', cy: '9', r: '12.5', fill: `url(#${PREFIX}-glow)` }),
+          // Working ring: a dashed arc orbiting the mark, outside the silhouette.
+          h('circle', {
+            className: `${PREFIX}-ring`,
+            cx: '11.5',
+            cy: '8.5',
+            r: '14.2',
+            fill: 'none',
+            stroke: '#4D6BFE',
+            strokeWidth: '0.7',
+            strokeLinecap: 'round',
+            strokeDasharray: '5 44',
+          }),
+        ),
         h(
           'g',
           { className: `${PREFIX}-body` },
@@ -1282,18 +1304,6 @@ window.__ModuleLoader__.load({
         h('circle', { className: `${PREFIX}-bub`, cx: '2.2', cy: '12.4', r: '0.8', fill: '#7BA0FF', opacity: '.65' }),
         h('circle', { className: `${PREFIX}-bub ${PREFIX}-bub2`, cx: '1.4', cy: '9.2', r: '0.55', fill: '#9DB8FF', opacity: '.6' }),
         h('circle', { className: `${PREFIX}-bub ${PREFIX}-bub3`, cx: '2.9', cy: '15.6', r: '0.5', fill: '#9DB8FF', opacity: '.6' }),
-        // Working ring: a dashed arc orbiting the mark, outside the silhouette.
-        h('circle', {
-          className: `${PREFIX}-ring`,
-          cx: '11.5',
-          cy: '8.5',
-          r: '14.2',
-          fill: 'none',
-          stroke: '#4D6BFE',
-          strokeWidth: '0.7',
-          strokeLinecap: 'round',
-          strokeDasharray: '5 44',
-        }),
       );
     }
 

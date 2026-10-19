@@ -3,7 +3,7 @@
 | 项 | 值 |
 |---|---|
 | 被分析版本 | `dsh-whale-pet@1.0.0`（profile 中由 GitHub tarball 安装） |
-| 优化版本 | `1.2.0`（权限紧急提示） |
+| 优化版本 | `1.2.1`（权限紧急提示 + 光环跟随） |
 | 对照插件 | `dsh-context@0.73.3` |
 | 运行环境 | DeepSeek Harness Web GUI（profile `desktop`） |
 | 改动范围 | Host `index.js`（待授权折叠）+ Browser `client.js`（上下文面板 / 紧急音 / 轮询） |
@@ -137,6 +137,16 @@ Browser 半侧：
 - 面板顶部列出待授权工具、原因与会话标签。
 
 这个功能必须改 Host，所以**安装这一版后要重启一次 DSH**；重启后 `GET /pet-whale/state` 的 `version` 变为 `4`。
+
+### 3.7 动画同步（v1.2.1）
+
+工作时鲸鱼本体用 `bob` 上下浮动（同时带 ±1.2° 摆动）。虚线工作环与光晕原来各自固定在中心，视觉上像鲸鱼穿过一个静止的环。现在二者被放进同一个 `orbit` 组：
+
+- `orbit` 只做 `translateY(0 → -7px → 0)`，与本体 `bob` 的垂直分量同周期（空闲 3.4s / 工作 1.15s）；
+- 环自身仍保留 `spin` 旋转，光晕保留 `pulse` / `flash` 透明度；
+- `prefers-reduced-motion` 下三者的动画一起关闭。
+
+这样“转圈圈的光影”会跟着鲸鱼一起上下，而不会左右摆动或改变环的形状。
 
 ---
 
