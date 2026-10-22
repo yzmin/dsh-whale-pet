@@ -461,15 +461,22 @@ window.__ModuleLoader__.load({
       let inputCost = 0;
       let outputCost = 0;
       let saw = false;
-      for (const provider of Object.values(usage)) {
+      let deepSeekSeen = false;
+      for (const [providerId, provider] of Object.entries(usage)) {
         if (provider === null || typeof provider !== 'object') continue;
+        // dsh-context only splits DeepSeek by billing period; every other
+        // provider is booked entirely under `peak` at its normal/list price.
+        // Treating that custom `peak` bucket as a 2× peak would double-charge
+        // every gateway request, so use the off-peak/list rate there.
+        const deepSeek = providerId === 'deepseek' || providerId.startsWith('deepseek-');
+        if (deepSeek) deepSeekSeen = true;
         for (const [modelId, periods] of Object.entries(provider)) {
           if (periods === null || typeof periods !== 'object') continue;
           const rates = models[modelId] ?? fallback;
           for (const period of ['peak', 'off']) {
             const bucket = periods[period];
             if (bucket === null || typeof bucket !== 'object') continue;
-            const rate = period === 'peak' ? rates.peak : rates.offPeak;
+            const rate = period === 'peak' && deepSeek ? rates.peak : rates.offPeak;
             if (rate === undefined) continue;
             cacheHitCost += per(bucket.cacheRead) * rate.hit;
             inputCost += (per(bucket.uncached) + per(bucket.cacheWrite)) * rate.miss;
@@ -479,7 +486,14 @@ window.__ModuleLoader__.load({
         }
       }
       if (!saw) return undefined;
-      return { cacheHitCost, inputCost, outputCost, total: cacheHitCost + inputCost + outputCost, split: true };
+      return {
+        cacheHitCost,
+        inputCost,
+        outputCost,
+        total: cacheHitCost + inputCost + outputCost,
+        split: true,
+        standard: !deepSeekSeen,
+      };
     }
 
     /** A zeroed bucket set for the client-side rollups. */
@@ -559,8 +573,13 @@ window.__ModuleLoader__.load({
       if (usage === null || typeof usage !== 'object') return undefined;
       const periods = { peak: zeroTokens(), off: zeroTokens() };
       let saw = false;
-      for (const provider of Object.values(usage)) {
+      for (const [providerId, provider] of Object.entries(usage)) {
         if (provider === null || typeof provider !== 'object') continue;
+        // Non-DeepSeek providers have no real peak/off split in dsh-context;
+        // they are booked under `peak` at list price. Returning those as peak
+        // tokens would be a fake breakdown, so leave them to the record/Host
+        // paths (or to the current-period fallback).
+        if (providerId !== 'deepseek' && !providerId.startsWith('deepseek-')) continue;
         for (const model of Object.values(provider)) {
           if (model === null || typeof model !== 'object') continue;
           for (const period of ['peak', 'off']) {
@@ -574,6 +593,51 @@ window.__ModuleLoader__.load({
             saw = true;
           }
         }
+      }
+      return saw ? periods : undefined;
+    }
+
+    /**
+     * Whether an instant falls in DeepSeek's peak billing window.
+     * Beijing time, Monday–Friday, 09:00–12:00 and 14:00–18:00.
+     */
+    function isPeakTime(time) {
+      if (typeof time !== 'number' || !Number.isFinite(time)) return false;
+      const beijing = new Date(time + 8 * 60 * 60 * 1000);
+      const day = beijing.getUTCDay();
+      const hour = beijing.getUTCHours();
+      return day >= 1 && day <= 5 && ((hour >= 9 && hour < 12) || (hour >= 14 && hour < 18));
+    }
+
+    /**
+     * Recover a peak/off split from interaction records.
+     *
+     * Records written before Host v5 have no `periods`, but they do carry the
+     * episode's start/end time and its token buckets. Classifying the whole
+     * episode by its end time is approximate for an episode that crosses a
+     * boundary, but it is far better than pricing a brand-new off-peak session
+     * at peak rates merely because dsh-context books non-DeepSeek providers
+     * under its `peak` bucket.
+     */
+    function periodsFromRecords(records) {
+      if (!Array.isArray(records)) return undefined;
+      const periods = { peak: zeroTokens(), off: zeroTokens() };
+      let saw = false;
+      for (const record of records) {
+        if (record === null || typeof record !== 'object') continue;
+        const bucket = record.tokens;
+        if (bucket === null || typeof bucket !== 'object') continue;
+        const recorded = record.periods === null || typeof record.periods !== 'object' ? undefined : periodsTokens(record.periods);
+        if (recorded !== undefined && tokensTotal(recorded) > 0) {
+          addBuckets(periods.peak, record.periods.peak);
+          addBuckets(periods.off, record.periods.off);
+          saw = true;
+          continue;
+        }
+        const at = typeof record.endedAt === 'number' ? record.endedAt : record.startedAt;
+        if (typeof at !== 'number' || !Number.isFinite(at)) continue;
+        addBuckets(periods[isPeakTime(at) ? 'peak' : 'off'], bucket);
+        saw = true;
       }
       return saw ? periods : undefined;
     }
@@ -1720,9 +1784,10 @@ window.__ModuleLoader__.load({
       for (const record of today) {
         const bucket = record.tokens;
         if (bucket !== null && typeof bucket === 'object') addBuckets(todayTokens, bucket);
-        if (record.periods !== null && typeof record.periods === 'object') {
-          addBuckets(todayPeriods.peak, record.periods.peak);
-          addBuckets(todayPeriods.off, record.periods.off);
+        const recordPeriods = periodsFromRecords([record]);
+        if (recordPeriods !== undefined) {
+          addBuckets(todayPeriods.peak, recordPeriods.peak);
+          addBuckets(todayPeriods.off, recordPeriods.off);
           todayHasPeriods = true;
         } else if (bucket !== null && typeof bucket === 'object') {
           addBuckets(todayLoose, bucket);
@@ -1894,25 +1959,29 @@ window.__ModuleLoader__.load({
           h(
             'span',
             { className: `${PREFIX}-note` },
-            cost.split ? (cost.partial ? '部分时段 · partial' : '按请求时段 · mixed') : peak ? '高峰价 peak' : '低谷价 off-peak',
+            cost.standard
+              ? '标准价 · list'
+              : cost.split
+                ? (cost.partial ? '部分时段 · partial' : '按请求时段 · mixed')
+                : peak ? '高峰价 peak' : '低谷价 off-peak',
           ),
         ),
         hasPeriods && (peakTokens > 0 || offTokens > 0)
           ? h(
               'div',
               null,
-              h('div', { className: `${PREFIX}-sectsub` }, '峰谷用量 · Peak / off-peak'),
+              h('div', { className: `${PREFIX}-sectsub` }, '忙时 / 闲时 · Peak / off-peak'),
               h(
                 'div',
                 { className: `${PREFIX}-kv` },
-                h('span', { className: `${PREFIX}-k` }, '高峰 token Peak'),
+                h('span', { className: `${PREFIX}-k` }, '忙时 token Peak'),
                 h('span', { className: `${PREFIX}-v` }, count(peakTokens)),
                 h('span', { className: `${PREFIX}-note` }, money(priceTokens(peakBucket ?? {}, peakRate).total, symbol)),
               ),
               h(
                 'div',
                 { className: `${PREFIX}-kv` },
-                h('span', { className: `${PREFIX}-k` }, '低谷 token Off-peak'),
+                h('span', { className: `${PREFIX}-k` }, '闲时 token Off-peak'),
                 h('span', { className: `${PREFIX}-v` }, count(offTokens)),
                 h('span', { className: `${PREFIX}-note` }, money(priceTokens(offBucket ?? {}, offRate).total, symbol)),
               ),
@@ -1959,7 +2028,9 @@ window.__ModuleLoader__.load({
                   h('br'),
                   session.periodsSource === 'context'
                     ? 'Token 与峰/谷分桶来自浏览器完整投影；交互明细为主机启动后记录。'
-                    : 'Token 来自浏览器完整会话投影；交互明细与峰/谷分桶为主机启动后记录，可能不完整。',
+                    : session.periodsSource === 'records'
+                      ? 'Token 来自浏览器完整投影；峰/谷分桶按交互记录时间估算，交互明细为主机启动后记录。'
+                      : 'Token 来自浏览器完整会话投影；交互明细与峰/谷分桶为主机启动后记录，可能不完整。',
                 )
               : null,
         ),
@@ -1971,7 +2042,8 @@ window.__ModuleLoader__.load({
             )
           : null,
         records.slice(0, 12).map((record) => {
-          const splitRecord = record.tokens === undefined ? undefined : pricePeriods(record.periods, table, model);
+          const recordPeriods = periodsFromRecords([record]);
+          const splitRecord = record.tokens === undefined ? undefined : pricePeriods(recordPeriods, table, model);
           const recordCost = record.tokens === undefined
             ? undefined
             : splitRecord !== undefined && (splitRecord.total > 0 || tokensTotal(record.tokens) === 0)
@@ -2670,25 +2742,53 @@ window.__ModuleLoader__.load({
         [contextTargetId, listSnapshot, statusSnapshot, hostState, projectionTick, open],
       );
 
+      /** The session row the card renders, with the fullest peak/off split available. */
+      const displaySession = useMemo(() => {
+        if (accountingSession === undefined) return accountingSession;
+        const hostPeriods = accountingSession.periods;
+        const recordPeriods = periodsFromRecords(accountingRecords);
+        const durableTotal = accountingSession.totalTokens ?? 0;
+        const hostTotal = hostPeriods === undefined ? 0 : tokensTotal(periodsTokens(hostPeriods));
+        const recordTotal = recordPeriods === undefined ? 0 : tokensTotal(periodsTokens(recordPeriods));
+        if (hostTotal > 0 && hostTotal >= durableTotal) {
+          return { ...accountingSession, periods: hostPeriods, periodsSource: 'host' };
+        }
+        if (recordTotal > 0 && recordTotal >= durableTotal) {
+          return { ...accountingSession, periods: recordPeriods, periodsSource: 'records' };
+        }
+        const fromContext = periodsFromCostUsage(context?.cost);
+        if (fromContext !== undefined) {
+          return { ...accountingSession, periods: fromContext, periodsSource: 'context' };
+        }
+        if (hostTotal > 0) {
+          return { ...accountingSession, periods: hostPeriods, periodsSource: 'host' };
+        }
+        if (recordTotal > 0) {
+          return { ...accountingSession, periods: recordPeriods, periodsSource: 'records' };
+        }
+        return accountingSession;
+      }, [accountingSession, accountingRecords, context]);
+
       /**
        * Price the session.
        *
-       * Prefer dsh-context's per-period cost buckets, so a session that crossed
-       * peak/off-peak gets each request's own rate. Fall back to pricing the
-       * durable tokenUsage buckets with the currently active period when that
-       * projection is unavailable.
+       * Prefer a peak/off split that covers the FULL durable session (Host v5 or
+       * record timestamps). dsh-context's cost projection is the next fallback;
+       * its per-period price depends on whether the provider is DeepSeek. A
+       * partial split's unrecorded remainder is priced at the currently active
+       * period and marked partial.
        */
       const accountingCost = useMemo(() => {
+        const total = tokensTotal(accountingSession?.tokens ?? {});
+        const periodCost = pricePeriods(displaySession?.periods, rateTable, rateModel);
+        const known = periodsTokens(displaySession?.periods);
+        if (periodCost !== undefined && tokensTotal(known) >= total) return periodCost;
+
         const split = priceCostUsage(context?.cost, rateTable, rateModel);
         if (split !== undefined) return split;
 
-        // No dsh-context cost projection: use the Host's own peak/off buckets.
-        // The Host may have started mid-session, so the unrecorded remainder is
-        // priced at the currently active period and marked partial rather than
-        // pretending the whole session happened now.
-        const periodCost = pricePeriods(accountingSession?.periods, rateTable, rateModel);
         if (periodCost !== undefined) {
-          const rest = subtractBuckets(accountingSession?.tokens ?? {}, periodsTokens(accountingSession.periods));
+          const rest = subtractBuckets(accountingSession?.tokens ?? {}, known);
           if (tokensTotal(rest) > 0) {
             const extra = priceTokens(rest, rate);
             return {
@@ -2703,15 +2803,7 @@ window.__ModuleLoader__.load({
           return periodCost;
         }
         return priceTokens(accountingSession?.tokens ?? {}, rate);
-      }, [accountingSession, context, rate, rateTable, rateModel]);
-
-      /** The session row the card renders, with the fullest peak/off split available. */
-      const displaySession = useMemo(() => {
-        if (accountingSession === undefined) return accountingSession;
-        const fromContext = periodsFromCostUsage(context?.cost);
-        if (fromContext === undefined) return accountingSession;
-        return { ...accountingSession, periods: fromContext, periodsSource: 'context' };
-      }, [accountingSession, context]);
+      }, [accountingSession, displaySession, context, rate, rateTable, rateModel]);
 
       // Load the active session's projections once when the session changes, not
       // only when the panel opens: the context card should populate from a cold start

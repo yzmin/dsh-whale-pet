@@ -3,7 +3,7 @@
 | 项 | 值 |
 |---|---|
 | 被分析版本 | `dsh-whale-pet@1.0.0`（profile 中由 GitHub tarball 安装） |
-| 优化版本 | `1.4.0`（峰谷时间分桶 + 客户端 `id` 修正 + 完整 token 投影） |
+| 优化版本 | `1.4.1`（非 DeepSeek 峰谷修正 + 记录时间回退） |
 | 对照插件 | `dsh-context@0.73.3` |
 | 运行环境 | DeepSeek Harness Web GUI（profile `desktop`） |
 | 改动范围 | Host `index.js`（待授权折叠）+ Browser `client.js`（上下文面板 / 紧急音 / 轮询） |
@@ -49,6 +49,7 @@
 | 10 | **Host 的 token 总量只从本插件进程启动后开始折叠** | 长会话在 DSH 重启后，Host `sessionTotals` 只包含重启后的用量。实测当前会话 Host 为 `43,681,717`，而持久日志为 `139,047,233`（406 次请求）；账本因此明显偏低，和 dsh-context 的完整投影不一致。 | 当前会话优先读浏览器 `tokenUsage` 完整投影，Host 行只保留 label / 请求数 / 明细；卡片注明“Token 来自完整投影，交互明细为主机启动后记录”。 |
 | 11 | **客户端会话列表行用 `id`，代码却读 `sessionId`** | `useSessions` 快照的每一行是 `{ id, title, retainedBy, ... }`；`activeSessionId` 用 `row.retainedBy.mainView` 找到行后取 `row.sessionId`，恒为 `undefined`，于是退回 `runningKey` / “花费最多”的会话。当前窗口明明打开 A 会话，宠物却显示 B。 | 所有列表行统一读 `row.id ?? row.sessionId`；标签读 `row.title ?? row.displayTitle`；新增 `id` 形状的渲染测试。 |
 | 12 | **费用按单一“当前时段”估算** | Host 只存会话 token 总量，没有记录每个请求发生在高峰还是低谷；跨时段的会话会把所有 token 按渲染时的时段计价，误差可能很大。 | Host 对每个 `assistant/message` 按事件时间落入 `peak` / `off` 桶，session 与 record 都带 `periods`；客户端优先用 dsh-context 的完整峰谷分桶，其次用 Host 的 `periods`，并把未记录的历史部分按当前时段补估且标注 partial；快照升到 v5。 |
+| 13 | **自定义 provider 的 `peak` 桶被当成 DeepSeek 高峰** | dsh-context 只给 DeepSeek 分峰谷；其他 provider（如本地网关 `simware`）的 usage 全部放进 `peak`，但那是 **list 价**，不是 2× 高峰。客户端把 `simware` 的 `peak` 按高峰费率算，且在 19:58 显示“高峰 77,315 / 低谷 0”，费用翻倍。 | 非 DeepSeek provider 的 `peak` 桶改用 `offPeak`/list 费率；峰/谷展示优先用 Host `periods`，没有时用交互记录的 `endedAt` 时间回退分类；仍无真实时段时标“标准价 · list”，不伪造高峰。 |
 
 ---
 
@@ -204,6 +205,12 @@ Browser 半侧：
 | Client | 优先用 dsh-context `contextTimeline.cost` 的完整 peak/off 分桶；没有时用 Host `periods`；Host 启动前的历史缺口按当前时段补估，并标注 `partial` |
 
 峰/谷窗口按北京时间工作日 09–12、14–18；周末按低谷。中国法定节假日没有单独建模，节假日请求会被当作高峰，卡片已注明可能高估。
+
+**旧记录与非 DeepSeek provider（v1.4.1）：**
+
+- dsh-context 的 `cost` 对非 DeepSeek provider 只给一个 `peak` 桶，表示 list 价，不是高峰 2×；客户端对这类 provider 用 `offPeak` 费率，避免网关请求翻倍。
+- Host v5 之前的交互记录没有 `periods`，客户端用记录的 `endedAt` 时间回退分桶；一个 19:56 开始的会话会显示为低谷，而不是高峰。
+- 两个来源都没有真实时段时，合计标“标准价 · list”，不把未知时段伪造成高峰。
 
 Host 的 `periods` 只覆盖本插件进程启动后的请求；要让当前长会话的历史也精确，仍依赖 dsh-context 的完整 `contextTimeline.cost`。Host v5 需要重启一次 DSH 才会开始记录新字段。
 
