@@ -399,6 +399,7 @@ window.__ModuleLoader__.load({
         turns: nonNegative(counts?.turns),
         steps: nonNegative(counts?.steps),
         reserve: nonNegative(timeline?.maxOutputTokens),
+        cost: timeline !== undefined && timeline.cost !== null && typeof timeline.cost === 'object' ? timeline.cost : undefined,
         model: typeof timeline?.model === 'string' ? timeline.model : undefined,
         hasTimeline,
         hasPressure,
@@ -433,6 +434,52 @@ window.__ModuleLoader__.load({
         outputCost,
         total: cacheHitCost + inputCost + outputCost,
       };
+    }
+
+    /**
+     * Price dsh-context's per-provider/model, per-period cost buckets.
+     *
+     * The `contextTimeline.cost` projection already splits provider-reported
+     * tokens into peak/off-peak buckets per model. Pricing those buckets with
+     * the matching period rate is more accurate than pricing the whole session
+     * with whatever period happens to be active now — a session that crossed a
+     * peak boundary otherwise gets every token at one rate.
+     *
+     * Unknown model ids fall back to the selected model's rate table, because
+     * custom providers (e.g. a local gateway) rarely appear there.
+     *
+     * @returns `{cacheHitCost,inputCost,outputCost,total,split:true}`, or
+     *   undefined when there is no usable cost projection.
+     */
+    function priceCostUsage(usage, table, fallbackModel) {
+      if (usage === null || typeof usage !== 'object') return undefined;
+      const models = table !== null && typeof table === 'object' && table.models !== null && typeof table.models === 'object' ? table.models : {};
+      const fallback = models[fallbackModel] ?? Object.values(models)[0];
+      if (fallback === undefined) return undefined;
+      const per = (value) => (typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0) / 1_000_000;
+      let cacheHitCost = 0;
+      let inputCost = 0;
+      let outputCost = 0;
+      let saw = false;
+      for (const provider of Object.values(usage)) {
+        if (provider === null || typeof provider !== 'object') continue;
+        for (const [modelId, periods] of Object.entries(provider)) {
+          if (periods === null || typeof periods !== 'object') continue;
+          const rates = models[modelId] ?? fallback;
+          for (const period of ['peak', 'off']) {
+            const bucket = periods[period];
+            if (bucket === null || typeof bucket !== 'object') continue;
+            const rate = period === 'peak' ? rates.peak : rates.offPeak;
+            if (rate === undefined) continue;
+            cacheHitCost += per(bucket.cacheRead) * rate.hit;
+            inputCost += (per(bucket.uncached) + per(bucket.cacheWrite)) * rate.miss;
+            outputCost += per(bucket.output) * rate.output;
+            saw = true;
+          }
+        }
+      }
+      if (!saw) return undefined;
+      return { cacheHitCost, inputCost, outputCost, total: cacheHitCost + inputCost + outputCost, split: true };
     }
 
     /** Group digits for readability: `1234567` → `1,234,567`. */
@@ -1529,7 +1576,7 @@ window.__ModuleLoader__.load({
      * so the per-episode rows and the session total are priced by the same rule
      * and always agree.
      */
-    function AccountSection({ session, records, todayRecords, cost, rate, model, models, table, currency, symbol, peak, balance, onModel, onCurrency }) {
+    function AccountSection({ session, records, todayRecords, requests, cost, rate, model, models, table, currency, symbol, peak, balance, onModel, onCurrency }) {
       if (session === undefined || session.tokens === undefined) {
         return h(
           'div',
@@ -1659,7 +1706,7 @@ window.__ModuleLoader__.load({
             { className: `${PREFIX}-note` },
             records.length === 0 && session.totalTokens > 0
               ? '记录已滚出窗口'
-              : `${Math.round(records.length)} 次交互`,
+              : `${Math.round(records.length)} 次交互${session.source === 'merged' ? ' · 记录窗口内' : ''}`,
           ),
         ),
         h(
@@ -1674,7 +1721,7 @@ window.__ModuleLoader__.load({
           { className: `${PREFIX}-kv` },
           h('span', { className: `${PREFIX}-k` }, '计费总 token Billed'),
           h('span', { className: `${PREFIX}-v` }, count(session.totalTokens)),
-          h('span', { className: `${PREFIX}-note` }, `${count(t.requests)} 次请求`),
+          h('span', { className: `${PREFIX}-note` }, `${count(requests || t.requests)} 次请求`),
         ),
         // Account balance: the wallets the Platform reports, in their own
         // currency, as a reference next to what this session has spent.
@@ -1728,7 +1775,7 @@ window.__ModuleLoader__.load({
           h(
             'span',
             { className: `${PREFIX}-note` },
-            peak ? '高峰价 peak' : '低谷价 off-peak',
+            cost.split ? '按请求时段 · mixed' : peak ? '高峰价 peak' : '低谷价 off-peak',
           ),
         ),
         h('div', { className: `${PREFIX}-sectsub` }, '今日用量 · Today'),
@@ -1761,7 +1808,9 @@ window.__ModuleLoader__.load({
           '费用为本地费率估算；dsh-context 的 Context Stats 使用 models.dev 价目，估算结果可能与此处不同。',
           session.source === 'client'
             ? h('span', null, h('br'), '数据来源：浏览器会话投影（主机端尚未上报，因此没有分次明细与请求次数）。')
-            : null,
+            : session.source === 'merged'
+              ? h('span', null, h('br'), 'Token 来自浏览器完整会话投影；交互明细为主机启动后记录，可能不完整。')
+              : null,
         ),
         records.length > 0
           ? h(
@@ -2379,7 +2428,22 @@ window.__ModuleLoader__.load({
         const rows = hostState.sessions ?? [];
         if (activeSessionId !== undefined) {
           const activeRow = rows.find((row) => row.sessionId === activeSessionId);
-          if (activeRow !== undefined) return activeRow;
+          if (activeRow !== undefined) {
+            // The Host folds only events seen since this plugin process loaded;
+            // a long-lived session therefore looks cheaper than its durable log.
+            // The browser `tokenUsage` projection is the full session, so prefer
+            // it for the money/token figures and keep the Host row's request count.
+            const durable = readClientTokens(servicesRef.current?.get?.('sessions'), activeSessionId);
+            if (durable !== undefined) {
+              return {
+                ...activeRow,
+                tokens: { ...durable, requests: activeRow.tokens?.requests ?? durable.requests },
+                totalTokens: tokensTotal(durable),
+                source: 'merged',
+              };
+            }
+            return activeRow;
+          }
           if (clientFallbackSession?.sessionId === activeSessionId) return clientFallbackSession;
 
           const listRow = listSnapshot?.byId?.[activeSessionId];
@@ -2423,10 +2487,6 @@ window.__ModuleLoader__.load({
         if (typeof sessionId !== 'string' || sessionId === '') return [];
         return records.filter((record) => record.sessionId === sessionId);
       }, [records, accountingSession]);
-      const accountingCost = useMemo(
-        () => priceTokens(accountingSession?.tokens ?? {}, rate),
-        [accountingSession, rate],
-      );
 
       /**
        * The session whose context the panel tracks.
@@ -2449,6 +2509,19 @@ window.__ModuleLoader__.load({
         () => readContext(servicesRef.current?.get?.('sessions'), contextTargetId),
         [contextTargetId, listSnapshot, statusSnapshot, hostState, projectionTick, open],
       );
+
+      /**
+       * Price the session.
+       *
+       * Prefer dsh-context's per-period cost buckets, so a session that crossed
+       * peak/off-peak gets each request's own rate. Fall back to pricing the
+       * durable tokenUsage buckets with the currently active period when that
+       * projection is unavailable.
+       */
+      const accountingCost = useMemo(() => {
+        const split = priceCostUsage(context?.cost, rateTable, rateModel);
+        return split ?? priceTokens(accountingSession?.tokens ?? {}, rate);
+      }, [accountingSession, context, rate, rateTable, rateModel]);
 
       // Load the active session's projections once when the session changes, not
       // only when the panel opens: the context card should populate from a cold start
@@ -2702,6 +2775,7 @@ window.__ModuleLoader__.load({
                   session: accountingSession,
                   records: accountingRecords,
                   todayRecords: records,
+                  requests: context?.steps || accountingSession?.tokens?.requests || 0,
                   cost: accountingCost,
                   rate,
                   model: rateModel,
