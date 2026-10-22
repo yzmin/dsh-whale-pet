@@ -1758,16 +1758,19 @@ window.__ModuleLoader__.load({
       const unclassified = subtractBuckets(t, classified);
       // Historical tokens (the part of the gap frozen on first observation) stay
       // peak. Only the *growth* of the gap is live poll lag and goes to the
-      // current period. This keeps the peak column stable while off-peak work
-      // streams in; it does not reclassify the session's history every poll.
-      const frozen = hasPeriods ? minBuckets(historicalGap ?? zeroTokens(), unclassified) : zeroTokens();
-      const live = subtractBuckets(unclassified, frozen);
+      // current period. Until a baseline exists, keep the whole gap in peak:
+      // moving it to off would silently erase the historical peak.
+      const hasHistory = historicalGap !== undefined;
+      const frozen = hasPeriods
+        ? (hasHistory ? minBuckets(historicalGap, unclassified) : unclassified)
+        : zeroTokens();
+      const live = hasPeriods && hasHistory ? subtractBuckets(unclassified, frozen) : zeroTokens();
       const peakBucket = zeroTokens();
       if (hasPeriods) addBuckets(peakBucket, session.periods.peak);
       addBuckets(peakBucket, hasPeriods ? frozen : unclassified);
       const offBucket = zeroTokens();
       if (hasPeriods) addBuckets(offBucket, session.periods.off);
-      if (hasPeriods && live !== undefined) addBuckets(peak === false ? offBucket : peakBucket, live);
+      if (hasPeriods && hasHistory) addBuckets(peak === false ? offBucket : peakBucket, live);
       const peakCost = priceTokens(peakBucket, peakRate);
       const offCost = priceTokens(offBucket, offRate);
       const shownCost = {
@@ -2766,6 +2769,10 @@ window.__ModuleLoader__.load({
         const sessionId = displaySession?.sessionId;
         const periods = displaySession?.periods;
         if (typeof sessionId !== 'string' || sessionId === '' || periods === undefined) return undefined;
+        // Only freeze once the durable token total is merged. The Host row alone
+        // may still show its small post-restart total; freezing then would turn
+        // the later historical gap into "live" and move it to off-peak.
+        if (displaySession.source !== 'merged') return undefined;
         const gap = subtractBuckets(displaySession.tokens ?? {}, periodsTokens(periods));
         let stored = periodBaselineRef.current.get(sessionId);
         if (stored === undefined) {
