@@ -469,6 +469,15 @@ window.__ModuleLoader__.load({
       return rest;
     }
 
+    /** Field-wise minimum, used to keep a frozen historical gap from growing. */
+    function minBuckets(left, right) {
+      const result = zeroTokens();
+      for (const key of ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'requests']) {
+        result[key] = Math.min(left?.[key] ?? 0, right?.[key] ?? 0);
+      }
+      return result;
+    }
+
     /**
      * Price a peak/off pair with the matching period rates.
      *
@@ -1682,7 +1691,7 @@ window.__ModuleLoader__.load({
      * so the per-episode rows and the session total are priced by the same rule
      * and always agree.
      */
-    function AccountSection({ session, records, todayRecords, requests, rate, model, models, table, currency, symbol, peak, balance, onModel, onCurrency }) {
+    function AccountSection({ session, records, todayRecords, requests, historicalGap, rate, model, models, table, currency, symbol, peak, balance, onModel, onCurrency }) {
       if (session === undefined || session.tokens === undefined) {
         return h(
           'div',
@@ -1747,24 +1756,18 @@ window.__ModuleLoader__.load({
       // (the conservative side) rather than inventing "unclassified".
       const classified = hasPeriods ? periodsTokens(session.periods) : zeroTokens();
       const unclassified = subtractBuckets(t, classified);
-      // Historical gaps (a long session that predates Host v5) go to peak.
-      // A short, mostly-covered session's gap is just the live poll lag — put it
-      // in the CURRENT period instead, otherwise a live off-peak request briefly
-      // appears in the peak row and then jumps back to zero on the next poll.
-      const knownTotal = tokensTotal(classified);
-      const billedTotal = tokensTotal(t);
-      const recentGap = hasPeriods
-        && typeof session.elapsedMs === 'number'
-        && session.elapsedMs < 60 * 60 * 1000
-        && billedTotal > 0
-        && knownTotal / billedTotal >= 0.25;
-      const gapPeriod = recentGap && peak === false ? 'off' : 'peak';
+      // Historical tokens (the part of the gap frozen on first observation) stay
+      // peak. Only the *growth* of the gap is live poll lag and goes to the
+      // current period. This keeps the peak column stable while off-peak work
+      // streams in; it does not reclassify the session's history every poll.
+      const frozen = hasPeriods ? minBuckets(historicalGap ?? zeroTokens(), unclassified) : zeroTokens();
+      const live = subtractBuckets(unclassified, frozen);
       const peakBucket = zeroTokens();
       if (hasPeriods) addBuckets(peakBucket, session.periods.peak);
-      if (gapPeriod === 'peak') addBuckets(peakBucket, unclassified);
+      addBuckets(peakBucket, hasPeriods ? frozen : unclassified);
       const offBucket = zeroTokens();
       if (hasPeriods) addBuckets(offBucket, session.periods.off);
-      if (gapPeriod === 'off') addBuckets(offBucket, unclassified);
+      if (hasPeriods && live !== undefined) addBuckets(peak === false ? offBucket : peakBucket, live);
       const peakCost = priceTokens(peakBucket, peakRate);
       const offCost = priceTokens(offBucket, offRate);
       const shownCost = {
@@ -2266,6 +2269,8 @@ window.__ModuleLoader__.load({
 
       const lastBusyRef = useRef(undefined);
       const localOpenRef = useRef(new Map());
+      /** Frozen historical peak/off gap per session, so live poll lag does not move peak. */
+      const periodBaselineRef = useRef(new Map());
       /** Cue memory shared by both completion observers — see `decideCue`. */
       const cueRef = useRef({
         sessions: new Map(),
@@ -2748,6 +2753,37 @@ window.__ModuleLoader__.load({
         return { ...accountingSession, periods: best.periods, periodsSource: best.source };
       }, [accountingSession, accountingRecords, context]);
 
+      /**
+       * Freeze the historical gap for this session.
+       *
+       * A long-lived session can have hundreds of millions of tokens from before
+       * Host v5, with only a small recent period split. Those historical tokens
+       * belong to peak, but new live tokens must NOT be added there while the
+       * Host catches up. Capture the initial gap once, keep it fixed, and let
+       * the client assign only the *growth* to the current period.
+       */
+      const periodBaseline = useMemo(() => {
+        const sessionId = displaySession?.sessionId;
+        const periods = displaySession?.periods;
+        if (typeof sessionId !== 'string' || sessionId === '' || periods === undefined) return undefined;
+        const gap = subtractBuckets(displaySession.tokens ?? {}, periodsTokens(periods));
+        let stored = periodBaselineRef.current.get(sessionId);
+        if (stored === undefined) {
+          const age = displaySession.elapsedMs;
+          // A fresh session's gap is just the live poll lag; a long session's
+          // gap is its pre-Host-v5 history.
+          stored = typeof age === 'number' && Number.isFinite(age) && age < 60 * 60 * 1000
+            ? zeroTokens()
+            : gap;
+          periodBaselineRef.current.set(sessionId, stored);
+        }
+        const clamped = minBuckets(stored, gap);
+        if (tokensTotal(clamped) !== tokensTotal(stored)) {
+          periodBaselineRef.current.set(sessionId, clamped);
+        }
+        return clamped;
+      }, [displaySession]);
+
       // Load the active session's projections once when the session changes, not
       // only when the panel opens: the context card should populate from a cold start
       // too. One delayed tick picks up the projection that arrives after the
@@ -3000,6 +3036,7 @@ window.__ModuleLoader__.load({
                   session: displaySession,
                   records: accountingRecords,
                   todayRecords: records,
+                  historicalGap: periodBaseline,
                   requests: context?.steps || accountingSession?.tokens?.requests || 0,
                   rate,
                   model: rateModel,
