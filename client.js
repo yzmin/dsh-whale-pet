@@ -1814,6 +1814,20 @@ window.__ModuleLoader__.load({
       const offRate = table?.models?.[model]?.offPeak ?? rate;
       const peakTokens = peakBucket === undefined ? 0 : tokensTotal(peakBucket);
       const offTokens = offBucket === undefined ? 0 : tokensTotal(offBucket);
+      const unclassified = hasPeriods ? subtractBuckets(t, periodsTokens(session.periods)) : undefined;
+      const unclassifiedBilled = unclassified === undefined ? 0 : tokensTotal(unclassified);
+      const unclassifiedCost = unclassifiedBilled > 0 ? priceTokens(unclassified, rate) : undefined;
+      const periodCost = hasPeriods ? pricePeriods(session.periods, table, model) : undefined;
+      const shownCost = periodCost === undefined
+        ? cost
+        : {
+            cacheHitCost: periodCost.cacheHitCost + (unclassifiedCost?.cacheHitCost ?? 0),
+            inputCost: periodCost.inputCost + (unclassifiedCost?.inputCost ?? 0),
+            outputCost: periodCost.outputCost + (unclassifiedCost?.outputCost ?? 0),
+            total: periodCost.total + (unclassifiedCost?.total ?? 0),
+            split: true,
+            partial: unclassifiedBilled > 0,
+          };
 
       /** One label/value row inside the grid. */
       const row = (label, value, extra) =>
@@ -1934,10 +1948,10 @@ window.__ModuleLoader__.load({
         // than only the sum.
         h('div', { className: `${PREFIX}-sectsub` }, 'Token 构成 · Breakdown'),
         [
-          ['输入 · 缓存未命中 Cache miss', t.inputTokens, cost.inputCost],
-          ['输入 · 缓存命中 Cache hit', t.cacheReadTokens, cost.cacheHitCost],
+          ['输入 · 缓存未命中 Cache miss', t.inputTokens, shownCost.inputCost],
+          ['输入 · 缓存命中 Cache hit', t.cacheReadTokens, shownCost.cacheHitCost],
           ...(t.cacheWriteTokens > 0 ? [['缓存写入 Cache write（按 miss 计费）', t.cacheWriteTokens, undefined]] : []),
-          ['输出 Output', t.outputTokens, cost.outputCost],
+          ['输出 Output', t.outputTokens, shownCost.outputCost],
           ...(t.reasoningTokens > 0 ? [['　其中思维链 of which reasoning', t.reasoningTokens, undefined]] : []),
         ].map(([label, value, amount], index) =>
           h(
@@ -1949,24 +1963,24 @@ window.__ModuleLoader__.load({
           ),
         ),
         h('div', { className: `${PREFIX}-sectsub` }, '花费明细 · Cost'),
-        row('输入侧 Input side', money(cost.inputCost, symbol), `miss ${symbol}${rate.miss}/M`),
-        row('输出侧 Output', money(cost.outputCost, symbol), `${symbol}${rate.output}/M`),
+        row('输入侧 Input side', money(shownCost.inputCost, symbol), `miss ${symbol}${rate.miss}/M`),
+        row('输出侧 Output', money(shownCost.outputCost, symbol), `${symbol}${rate.output}/M`),
         h(
           'div',
           { className: `${PREFIX}-kv ${PREFIX}-kvtot` },
           h('span', { className: `${PREFIX}-k` }, '合计 Total'),
-          h('span', { className: `${PREFIX}-v` }, money(cost.total, symbol)),
+          h('span', { className: `${PREFIX}-v` }, money(shownCost.total, symbol)),
           h(
             'span',
             { className: `${PREFIX}-note` },
-            cost.standard
+            shownCost.standard
               ? '标准价 · list'
-              : cost.split
-                ? (cost.partial ? '部分时段 · partial' : '按请求时段 · mixed')
+              : shownCost.split
+                ? (shownCost.partial ? '忙时+闲时+未分时段' : '忙时 + 闲时')
                 : peak ? '高峰价 peak' : '低谷价 off-peak',
           ),
         ),
-        hasPeriods && (peakTokens > 0 || offTokens > 0)
+        hasPeriods
           ? h(
               'div',
               null,
@@ -1985,6 +1999,15 @@ window.__ModuleLoader__.load({
                 h('span', { className: `${PREFIX}-v` }, count(offTokens)),
                 h('span', { className: `${PREFIX}-note` }, money(priceTokens(offBucket ?? {}, offRate).total, symbol)),
               ),
+              unclassifiedBilled > 0
+                ? h(
+                    'div',
+                    { className: `${PREFIX}-kv` },
+                    h('span', { className: `${PREFIX}-k` }, '未分时段 Unclassified'),
+                    h('span', { className: `${PREFIX}-v` }, count(unclassifiedBilled)),
+                    h('span', { className: `${PREFIX}-note` }, `${money(unclassifiedCost?.total ?? 0, symbol)} · 当前时段补估`),
+                  )
+                : null,
             )
           : null,
         h('div', { className: `${PREFIX}-sectsub` }, '今日用量 · Today'),
