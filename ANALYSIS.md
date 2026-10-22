@@ -3,7 +3,7 @@
 | 项 | 值 |
 |---|---|
 | 被分析版本 | `dsh-whale-pet@1.0.0`（profile 中由 GitHub tarball 安装） |
-| 优化版本 | `1.4.6`（实时间隙按当前时段，避免忙时闪变） |
+| 优化版本 | `1.4.7`（Host 时段桶持久化，重启不再清零） |
 | 对照插件 | `dsh-context@0.73.3` |
 | 运行环境 | DeepSeek Harness Web GUI（profile `desktop`） |
 | 改动范围 | Host `index.js`（待授权折叠）+ Browser `client.js`（上下文面板 / 紧急音 / 轮询） |
@@ -54,6 +54,7 @@
 | 15 | **忙/闲时单独成块，token 构成与费用脱节** | 峰谷块只给两个总数，用户看不到每个 token 桶的忙/闲构成；价格注释只显示当前时段，表格却用两套费率。 | Token 构成改成三列表格（项目 / 忙时 / 闲时），每格 token + 费用；移除单独峰谷块；价格注释同时列忙时/闲时费率（v1.4.4）。 |
 | 16 | **context 峰谷桶掩盖 Host 闲时桶** | dsh-context 可能把整会话放在一个 `peak`（list 价）桶里，覆盖 token 数最大；按“覆盖最多”选候选时它仍会盖掉 Host 已记录的闲时桶，闲时显示 0。 | Host / 记录只要有真实时段数据就优先，二者取覆盖大者；dsh-context 只在这两者都没有时兜底（v1.4.5）。 |
 | 17 | **实时间隙让忙时 token 闪变** | 浏览器 `tokenUsage` 先更新、Host `periods` 后到，二者之间的差额被归入忙时；一个闲时请求短暂显示在忙时，下一次轮询又归零。 | 会话年龄 < 1 小时且时段覆盖 ≥25% 时，把差额视为实时轮询间隙，归入**当前时段**；长时间会话的历史缺口仍归忙时（v1.4.6）。 |
+| 18 | **DSH 重启后 Host 时段桶清零** | `sessionTotals` 只在 Host 进程内存里；DSH 重启后，历史闲时桶全部丢失，只剩浏览器完整 token 总量，所有历史 token 被归入忙时，闲时显示 0。 | 每次 episode settle 后把 session 的 tokens / periods / 标签写入 `<profile>/storages/pet-whale/periods.json`，Host apply 时恢复（v1.4.7）。重启前的第一次丢失无法追回，但之后的时段会保留。 |
 
 ---
 
@@ -220,6 +221,7 @@ Browser 半侧：
 - **Token 构成内联忙/闲分列（v1.4.4）**：每行是缓存未命中 / 缓存命中 / 输出，每列是忙时 / 闲时的 token 与费用，不再单独放一个峰谷块；合计仍是两列相加。
 - **Host/记录优先，context 兜底（v1.4.5）**：Host `periods` 和交互记录都有真实时间；两者取覆盖大者。dsh-context 的 `cost` 只有在这两者都没有时段数据时才使用，避免整会话 `peak` 桶把 Host 已记录的闲时盖成 0。
 - **实时轮询间隙（v1.4.6）**：新会话在浏览器投影更新、Host 时段尚未到达的瞬间会把差额短暂算进忙时；现在年龄 <1h 且覆盖 ≥25% 的差额归当前时段，轮询追上后不再出现“忙时闪一下又归零”。长会话的历史缺口仍归忙时。
+- **时段持久化（v1.4.7）**：Host 在每个 episode 结算后把 tokens / periods 写入 `<DSH_PROFILE_DIR>/storages/pet-whale/periods.json`，启动时恢复；DSH 重启后历史忙/闲桶不再清零。持久化只覆盖已结算 episode，进行中的回合按浏览器完整投影 + 当前时段处理。
 
 Host 的 `periods` 只覆盖本插件进程启动后的请求；要让当前长会话的历史也精确，仍依赖 dsh-context 的完整 `contextTimeline.cost`。Host v5 需要重启一次 DSH 才会开始记录新字段。
 

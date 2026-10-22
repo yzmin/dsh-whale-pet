@@ -19,10 +19,30 @@
  * @module dsh-pet-whale
  */
 
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
 
 /** Stable Loader identity. */
 export const name = 'pet-whale';
+
+/**
+ * Durable peak/off accounting, kept beside the profile's other storage.
+ *
+ * The Host process is rebuilt on every DSH restart; without this file the
+ * session's historical peak/off split would reset to zero even though the
+ * session log still contains all tokens. Best-effort: a read or write failure
+ * only disables persistence for this process, it never breaks the panel.
+ */
+const PERIOD_STORE = join(
+  process.env.DSH_PROFILE_DIR
+    ?? join(process.env.DSH_HOME ?? homedir(), 'profiles', process.env.DSH_PROFILE ?? 'desktop'),
+  'storages',
+  'pet-whale',
+  'periods.json',
+);
+const PERIOD_STORE_VERSION = 1;
+const MAX_STORED_SESSIONS = 400;
 
 /**
  * Loopback route the browser half polls.
@@ -163,6 +183,28 @@ function isPeakTime(time) {
 /** The pricing bucket for one event time. */
 function periodKey(time) {
   return isPeakTime(time) ? 'peak' : 'off';
+}
+
+/** Validate/copy a token bucket read from the persisted store. */
+function storedTokens(value) {
+  const tokens = emptyTokens();
+  if (value === null || typeof value !== 'object') return tokens;
+  for (const key of TOKEN_KEYS) {
+    const count = value[key];
+    if (typeof count === 'number' && Number.isFinite(count) && count > 0) tokens[key] = count;
+  }
+  if (typeof value.requests === 'number' && Number.isFinite(value.requests) && value.requests > 0) {
+    tokens.requests = value.requests;
+  }
+  return tokens;
+}
+
+/** Validate/copy a peak/off pair read from the persisted store. */
+function storedPeriods(value) {
+  return {
+    peak: storedTokens(value?.peak),
+    off: storedTokens(value?.off),
+  };
 }
 
 /**
@@ -410,6 +452,59 @@ export function apply(ctx) {
   /** Read or create the accounting row, or undefined for an unusable key. */
   const totalsOfKey = (sessionId) => (isSessionKey(sessionId) ? totalsOf(sessionId) : undefined);
 
+  /** Persist settled per-session peak/off buckets across DSH restarts. */
+  let persistWarned = false;
+  const persist = () => {
+    try {
+      const sessions = [...sessionTotals]
+        .filter(([sessionId, entry]) => isSessionKey(sessionId) && entry !== undefined)
+        .sort((left, right) => (left[1].lastEventAt ?? 0) - (right[1].lastEventAt ?? 0))
+        .slice(-MAX_STORED_SESSIONS)
+        .map(([sessionId, entry]) => ({
+          id: sessionId,
+          label: labels.get(sessionId),
+          startedAt: entry.startedAt,
+          lastEventAt: entry.lastEventAt,
+          periodsFrom: entry.periodsFrom,
+          tokens: cloneTokens(entry.tokens),
+          periods: clonePeriods(entry.periods),
+        }));
+      mkdirSync(dirname(PERIOD_STORE), { recursive: true });
+      writeFileSync(PERIOD_STORE, JSON.stringify({
+        version: PERIOD_STORE_VERSION,
+        savedAt: Date.now(),
+        sessions,
+      }), 'utf8');
+    } catch (error) {
+      if (!persistWarned) {
+        persistWarned = true;
+        warn(ctx, `pet-whale: could not persist periods — ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  };
+  try {
+    const stored = JSON.parse(readFileSync(PERIOD_STORE, 'utf8'));
+    if (stored?.version === PERIOD_STORE_VERSION && Array.isArray(stored.sessions)) {
+      for (const row of stored.sessions) {
+        if (!isSessionKey(row?.id)) continue;
+        sessionTotals.set(row.id, {
+          startedAt: epochMs(row.startedAt),
+          lastEventAt: epochMs(row.lastEventAt),
+          periodsFrom: epochMs(row.periodsFrom),
+          tokens: storedTokens(row.tokens),
+          periods: storedPeriods(row.periods),
+        });
+        if (typeof row.label === 'string' && row.label !== '') labels.set(row.id, clip(row.label, 80));
+      }
+    }
+  } catch (error) {
+    // ENOENT is the normal first run; any other read error is just a loss of
+    // persisted detail, not a reason to fail the whole plugin.
+    if (error?.code !== 'ENOENT') {
+      warn(ctx, `pet-whale: could not read periods — ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   /** Add one bucket set into another, field by field. */
   const mergeTokens = (target, source) => {
     for (const key of TOKEN_KEYS) target[key] += source[key];
@@ -522,6 +617,7 @@ export function apply(ctx) {
       ...episode.error === undefined ? {} : { error: episode.error },
     });
     nextId += 1;
+    persist();
   };
 
   ctx.on('session/event', (session, event) => {
