@@ -3,7 +3,7 @@
 | 项 | 值 |
 |---|---|
 | 被分析版本 | `dsh-whale-pet@1.0.0`（profile 中由 GitHub tarball 安装） |
-| 优化版本 | `1.4.3`（只有忙时/闲时两态，历史缺口归忙时） |
+| 优化版本 | `1.4.4`（token 构成内联忙/闲分列） |
 | 对照插件 | `dsh-context@0.73.3` |
 | 运行环境 | DeepSeek Harness Web GUI（profile `desktop`） |
 | 改动范围 | Host `index.js`（待授权折叠）+ Browser `client.js`（上下文面板 / 紧急音 / 轮询） |
@@ -51,6 +51,8 @@
 | 12 | **费用按单一“当前时段”估算** | Host 只存会话 token 总量，没有记录每个请求发生在高峰还是低谷；跨时段的会话会把所有 token 按渲染时的时段计价，误差可能很大。 | Host 对每个 `step/start` 按时间落入 `peak` / `off` 桶，session 与 record 都带 `periods`；客户端优先用 Host/记录的真实时段；没有时段记录的历史 token 归入忙时；快照升到 v5。 |
 | 13 | **自定义 provider 的 `peak` 桶被当成 DeepSeek 高峰** | dsh-context 只给 DeepSeek 分峰谷；其他 provider（如本地网关 `simware`）的 usage 全部放进 `peak`，但那是 **list 价**，不是 2× 高峰。客户端把 `simware` 的 `peak` 按高峰费率算，且在 19:58 显示“高峰 77,315 / 低谷 0”，费用翻倍。 | 非 DeepSeek 的 context `peak` 桶不再当作时段依据；优先 Host `periods` / 记录 `endedAt` 的真实时段；没有真实时段时归入忙时。 |
 | 14 | **合计与忙时/闲时行对不上** | Total 取的是 `accountingCost.total`（可能来自 context 或补估），而忙时/闲时行只展示 `periods` 覆盖的部分；历史缺口没有行，合计 ≠ 两行之合。 | 取消“未分时段”第三状态：未覆盖的历史 token **并入忙时**；Total 直接由忙时费用 + 闲时费用逐行求和，两行永远等于合计（v1.4.3）。 |
+| 15 | **忙/闲时单独成块，token 构成与费用脱节** | 峰谷块只给两个总数，用户看不到每个 token 桶的忙/闲构成；价格注释只显示当前时段，表格却用两套费率。 | Token 构成改成三列表格（项目 / 忙时 / 闲时），每格 token + 费用；移除单独峰谷块；价格注释同时列忙时/闲时费率（v1.4.4）。 |
+| 16 | **小的 context 峰谷桶掩盖 Host 闲时桶** | `displaySession` 先取 context `periods`，即使它只覆盖少量 token（例如标题模型）；剩余历史 token 全部归忙时，于是 Host 已记录的 14M 闲时被盖掉，闲时显示 0。 | host / records / context 三个候选取 **覆盖 token 最多** 的一个；Host 的部分闲时桶不会再被小的 context 峰桶覆盖。 |
 
 ---
 
@@ -214,6 +216,8 @@ Browser 半侧：
 - Host v5 之前的交互记录没有 `periods`，客户端用记录的 `endedAt` 时间回退分桶；一个 19:56 开始的会话会显示为低谷，而不是高峰。
 - 两个来源都没有真实时段时，历史 token 归入忙时（保守估算），不伪造闲时。
 - **合计恒等于忙时 + 闲时**：未覆盖的历史 token 已并入忙时，不存在第三行；Total 直接从两行求和（v1.4.3）。
+- **Token 构成内联忙/闲分列（v1.4.4）**：每行是缓存未命中 / 缓存命中 / 输出，每列是忙时 / 闲时的 token 与费用，不再单独放一个峰谷块；合计仍是两列相加。
+- **峰谷候选按覆盖量选择（v1.4.4）**：Host、交互记录、dsh-context 三个来源谁的 token 覆盖最多就用谁，避免一个很小的 context 峰桶把 Host 已记录的闲时盖成 0。
 
 Host 的 `periods` 只覆盖本插件进程启动后的请求；要让当前长会话的历史也精确，仍依赖 dsh-context 的完整 `contextTimeline.cost`。Host v5 需要重启一次 DSH 才会开始记录新字段。
 

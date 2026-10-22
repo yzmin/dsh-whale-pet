@@ -1322,6 +1322,12 @@ window.__ModuleLoader__.load({
 .${PREFIX}-secthead .${PREFIX}-note{font-weight:400}
 .${PREFIX}-sesslabel{font-size:10.5px;color:var(--dsw-alias-label-secondary,#6b7280);margin:-2px 0 4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .${PREFIX}-sectsub{font-size:10.5px;font-weight:600;color:var(--dsw-alias-label-secondary,#6b7280);margin:7px 0 2px;letter-spacing:.02em}
+.${PREFIX}-bd{display:flex;flex-direction:column;gap:1px;margin:2px 0 4px}
+.${PREFIX}-bdrow{display:grid;grid-template-columns:minmax(0,1fr) 74px 74px;gap:6px;align-items:baseline;font-size:11px;line-height:1.45}
+.${PREFIX}-bdhead{font-size:9.5px;font-weight:600;color:var(--dsw-alias-label-secondary,#6b7280);letter-spacing:.02em}
+.${PREFIX}-bdk{color:var(--dsw-alias-label-secondary,#6b7280);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.${PREFIX}-bdnum{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;font-size:10.5px}
+.${PREFIX}-bdnum small{display:block;font-size:9.5px;color:var(--dsw-alias-label-secondary,#6b7280);font-weight:400;line-height:1.2}
 .${PREFIX}-kv{display:grid;grid-template-columns:1fr auto auto;align-items:baseline;gap:8px;font-size:11.5px;line-height:1.5}
 .${PREFIX}-k{color:var(--dsw-alias-label-secondary,#6b7280);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .${PREFIX}-v{font-variant-numeric:tabular-nums;font-weight:600}
@@ -1746,8 +1752,6 @@ window.__ModuleLoader__.load({
       addBuckets(peakBucket, unclassified);
       const offBucket = zeroTokens();
       if (hasPeriods) addBuckets(offBucket, session.periods.off);
-      const peakTokens = tokensTotal(peakBucket);
-      const offTokens = tokensTotal(offBucket);
       const peakCost = priceTokens(peakBucket, peakRate);
       const offCost = priceTokens(offBucket, offRate);
       const shownCost = {
@@ -1757,6 +1761,31 @@ window.__ModuleLoader__.load({
         total: peakCost.total + offCost.total,
         split: true,
       };
+      const missPeak = peakBucket.inputTokens + peakBucket.cacheWriteTokens;
+      const missOff = offBucket.inputTokens + offBucket.cacheWriteTokens;
+      const breakdownRows = [
+        {
+          label: '输入 · 缓存未命中 Cache miss',
+          peak: missPeak,
+          off: missOff,
+          peakAmount: (missPeak / 1_000_000) * peakRate.miss,
+          offAmount: (missOff / 1_000_000) * offRate.miss,
+        },
+        {
+          label: '输入 · 缓存命中 Cache hit',
+          peak: peakBucket.cacheReadTokens,
+          off: offBucket.cacheReadTokens,
+          peakAmount: (peakBucket.cacheReadTokens / 1_000_000) * peakRate.hit,
+          offAmount: (offBucket.cacheReadTokens / 1_000_000) * offRate.hit,
+        },
+        {
+          label: '输出 Output',
+          peak: peakBucket.outputTokens,
+          off: offBucket.outputTokens,
+          peakAmount: (peakBucket.outputTokens / 1_000_000) * peakRate.output,
+          offAmount: (offBucket.outputTokens / 1_000_000) * offRate.output,
+        },
+      ];
 
       /** One label/value row inside the grid. */
       const row = (label, value, extra) =>
@@ -1873,27 +1902,46 @@ window.__ModuleLoader__.load({
                   : `赠送 ${balance.bonusWallets.map((wallet) => walletText(wallet)).join(' · ')}`,
               ),
             ),
-        // Token buckets and their individual cost, so the split is visible rather
-        // than only the sum.
+        // Token composition and its peak/off split in one table: every bucket is
+        // already a row, so a separate busy/off-peak block would duplicate them.
         h('div', { className: `${PREFIX}-sectsub` }, 'Token 构成 · Breakdown'),
-        [
-          ['输入 · 缓存未命中 Cache miss', t.inputTokens, shownCost.inputCost],
-          ['输入 · 缓存命中 Cache hit', t.cacheReadTokens, shownCost.cacheHitCost],
-          ...(t.cacheWriteTokens > 0 ? [['缓存写入 Cache write（按 miss 计费）', t.cacheWriteTokens, undefined]] : []),
-          ['输出 Output', t.outputTokens, shownCost.outputCost],
-          ...(t.reasoningTokens > 0 ? [['　其中思维链 of which reasoning', t.reasoningTokens, undefined]] : []),
-        ].map(([label, value, amount], index) =>
+        h(
+          'div',
+          { className: `${PREFIX}-bd` },
           h(
             'div',
-            { className: `${PREFIX}-kv`, key: `${index}-${label}` },
-            h('span', { className: `${PREFIX}-k` }, label),
-            h('span', { className: `${PREFIX}-v` }, count(value)),
-            h('span', { className: `${PREFIX}-note` }, amount === undefined ? '' : money(amount, symbol)),
+            { className: `${PREFIX}-bdrow ${PREFIX}-bdhead` },
+            h('span', null, '项目'),
+            h('span', { className: `${PREFIX}-bdnum` }, '忙时 Peak'),
+            h('span', { className: `${PREFIX}-bdnum` }, '闲时 Off-peak'),
+          ),
+          breakdownRows.map((entry, index) =>
+            h(
+              'div',
+              { className: `${PREFIX}-bdrow`, key: `${index}-${entry.label}` },
+              h('span', { className: `${PREFIX}-bdk`, title: entry.label }, entry.label),
+              h(
+                'span',
+                { className: `${PREFIX}-bdnum` },
+                count(entry.peak),
+                h('small', null, money(entry.peakAmount, symbol)),
+              ),
+              h(
+                'span',
+                { className: `${PREFIX}-bdnum` },
+                count(entry.off),
+                h('small', null, money(entry.offAmount, symbol)),
+              ),
+            ),
           ),
         ),
-        h('div', { className: `${PREFIX}-sectsub` }, '花费明细 · Cost'),
-        row('输入侧 Input side', money(shownCost.inputCost, symbol), `miss ${symbol}${rate.miss}/M`),
-        row('输出侧 Output', money(shownCost.outputCost, symbol), `${symbol}${rate.output}/M`),
+        t.cacheWriteTokens > 0
+          ? h(
+              'div',
+              { className: `${PREFIX}-note ${PREFIX}-acctnote` },
+              `缓存写入 ${count(t.cacheWriteTokens)} 按 miss 计费，已包含在“缓存未命中”行。`,
+            )
+          : null,
         h(
           'div',
           { className: `${PREFIX}-kv ${PREFIX}-kvtot` },
@@ -1902,26 +1950,7 @@ window.__ModuleLoader__.load({
           h(
             'span',
             { className: `${PREFIX}-note` },
-            shownCost.split ? '忙时 + 闲时' : peak ? '高峰价 peak' : '低谷价 off-peak',
-          ),
-        ),
-        h(
-          'div',
-          null,
-          h('div', { className: `${PREFIX}-sectsub` }, '忙时 / 闲时 · Peak / off-peak'),
-          h(
-            'div',
-            { className: `${PREFIX}-kv` },
-            h('span', { className: `${PREFIX}-k` }, '忙时 token Peak'),
-            h('span', { className: `${PREFIX}-v` }, count(peakTokens)),
-            h('span', { className: `${PREFIX}-note` }, money(peakCost.total, symbol)),
-          ),
-          h(
-            'div',
-            { className: `${PREFIX}-kv` },
-            h('span', { className: `${PREFIX}-k` }, '闲时 token Off-peak'),
-            h('span', { className: `${PREFIX}-v` }, count(offTokens)),
-            h('span', { className: `${PREFIX}-note` }, money(offCost.total, symbol)),
+            '忙时 + 闲时',
           ),
         ),
         h('div', { className: `${PREFIX}-sectsub` }, '今日用量 · Today'),
@@ -1946,12 +1975,14 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: `${PREFIX}-note ${PREFIX}-acctnote` },
-          '今日统计基于宠物保留的交互记录（最多 80 条），跨会话汇总；有峰/谷记录时按请求时段计价，缺失时段的按当前费率补估。',
+          '今日统计基于宠物保留的交互记录（最多 80 条），跨会话汇总；有峰/谷记录时按请求时段计价，缺失时段的归入忙时。',
         ),
         h(
           'div',
           { className: `${PREFIX}-note ${PREFIX}-acctnote` },
-          `价格 ${models[model].label}（${table.label}）：缓存命中 ${symbol}${rate.hit}/M · 未命中 ${symbol}${rate.miss}/M · 输出 ${symbol}${rate.output}/M（每 1M token）`,
+          `价格 ${models[model].label}（${table.label}）：忙时 命中 ${symbol}${peakRate.hit}/M · 未命中 ${symbol}${peakRate.miss}/M · 输出 ${symbol}${peakRate.output}/M`,
+          h('br'),
+          `闲时 命中 ${symbol}${offRate.hit}/M · 未命中 ${symbol}${offRate.miss}/M · 输出 ${symbol}${offRate.output}/M（每 1M token）`,
           h('br'),
           '高峰时段为北京时间周一至周五 09–12、14–18 点（即 UTC 01–04、06–10）；中国法定节假日按低谷计费，此处未扣除，因此节假日可能高估。',
           h('br'),
@@ -2684,26 +2715,22 @@ window.__ModuleLoader__.load({
         if (accountingSession === undefined) return accountingSession;
         const hostPeriods = accountingSession.periods;
         const recordPeriods = periodsFromRecords(accountingRecords);
-        const durableTotal = accountingSession.totalTokens ?? 0;
         const hostTotal = hostPeriods === undefined ? 0 : tokensTotal(periodsTokens(hostPeriods));
         const recordTotal = recordPeriods === undefined ? 0 : tokensTotal(periodsTokens(recordPeriods));
-        if (hostTotal > 0 && hostTotal >= durableTotal) {
-          return { ...accountingSession, periods: hostPeriods, periodsSource: 'host' };
-        }
-        if (recordTotal > 0 && recordTotal >= durableTotal) {
-          return { ...accountingSession, periods: recordPeriods, periodsSource: 'records' };
-        }
-        const fromContext = periodsFromCostUsage(context?.cost);
-        if (fromContext !== undefined) {
-          return { ...accountingSession, periods: fromContext, periodsSource: 'context' };
-        }
-        if (hostTotal > 0) {
-          return { ...accountingSession, periods: hostPeriods, periodsSource: 'host' };
-        }
-        if (recordTotal > 0) {
-          return { ...accountingSession, periods: recordPeriods, periodsSource: 'records' };
-        }
-        return accountingSession;
+        const contextPeriods = periodsFromCostUsage(context?.cost);
+        const contextTotal = contextPeriods === undefined ? 0 : tokensTotal(periodsTokens(contextPeriods));
+
+        // Pick the candidate that covers the most tokens. A small context split
+        // (e.g. only a title-generation model) must not hide the Host's full
+        // off-peak bucket just because it appeared first.
+        const candidates = [];
+        if (hostTotal > 0) candidates.push({ periods: hostPeriods, total: hostTotal, source: 'host' });
+        if (recordTotal > 0) candidates.push({ periods: recordPeriods, total: recordTotal, source: 'records' });
+        if (contextTotal > 0) candidates.push({ periods: contextPeriods, total: contextTotal, source: 'context' });
+        candidates.sort((left, right) => right.total - left.total);
+        if (candidates.length === 0) return accountingSession;
+        const best = candidates[0];
+        return { ...accountingSession, periods: best.periods, periodsSource: best.source };
       }, [accountingSession, accountingRecords, context]);
 
       // Load the active session's projections once when the session changes, not
