@@ -1747,11 +1747,24 @@ window.__ModuleLoader__.load({
       // (the conservative side) rather than inventing "unclassified".
       const classified = hasPeriods ? periodsTokens(session.periods) : zeroTokens();
       const unclassified = subtractBuckets(t, classified);
+      // Historical gaps (a long session that predates Host v5) go to peak.
+      // A short, mostly-covered session's gap is just the live poll lag — put it
+      // in the CURRENT period instead, otherwise a live off-peak request briefly
+      // appears in the peak row and then jumps back to zero on the next poll.
+      const knownTotal = tokensTotal(classified);
+      const billedTotal = tokensTotal(t);
+      const recentGap = hasPeriods
+        && typeof session.elapsedMs === 'number'
+        && session.elapsedMs < 60 * 60 * 1000
+        && billedTotal > 0
+        && knownTotal / billedTotal >= 0.25;
+      const gapPeriod = recentGap && peak === false ? 'off' : 'peak';
       const peakBucket = zeroTokens();
       if (hasPeriods) addBuckets(peakBucket, session.periods.peak);
-      addBuckets(peakBucket, unclassified);
+      if (gapPeriod === 'peak') addBuckets(peakBucket, unclassified);
       const offBucket = zeroTokens();
       if (hasPeriods) addBuckets(offBucket, session.periods.off);
+      if (gapPeriod === 'off') addBuckets(offBucket, unclassified);
       const peakCost = priceTokens(peakBucket, peakRate);
       const offCost = priceTokens(offBucket, offRate);
       const shownCost = {
