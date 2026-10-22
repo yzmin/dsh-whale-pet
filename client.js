@@ -482,6 +482,102 @@ window.__ModuleLoader__.load({
       return { cacheHitCost, inputCost, outputCost, total: cacheHitCost + inputCost + outputCost, split: true };
     }
 
+    /** A zeroed bucket set for the client-side rollups. */
+    function zeroTokens() {
+      return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, requests: 0 };
+    }
+
+    /** Add one bucket set into another. */
+    function addBuckets(target, source) {
+      if (source === null || typeof source !== 'object') return target;
+      for (const key of ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'requests']) {
+        const value = source[key];
+        if (typeof value === 'number' && Number.isFinite(value) && value > 0) target[key] += value;
+      }
+      return target;
+    }
+
+    /** Sum a peak/off pair into one bucket set. */
+    function periodsTokens(periods) {
+      const total = zeroTokens();
+      if (periods === null || typeof periods !== 'object') return total;
+      addBuckets(total, periods.peak);
+      addBuckets(total, periods.off);
+      return total;
+    }
+
+    /** `total - known`, clamped per field; used for the unrecorded remainder. */
+    function subtractBuckets(total, known) {
+      const rest = zeroTokens();
+      for (const key of ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'reasoningTokens', 'requests']) {
+        rest[key] = Math.max(0, (total?.[key] ?? 0) - (known?.[key] ?? 0));
+      }
+      return rest;
+    }
+
+    /**
+     * Price a peak/off pair with the matching period rates.
+     *
+     * This is the fallback when dsh-context's `contextTimeline.cost` is absent:
+     * the Host records each assistant sample into the peak/off bucket of the
+     * event's timestamp, so even without the projection the session is not
+     * forced through whichever period happens to be active at render time.
+     *
+     * @returns `{cacheHitCost,inputCost,outputCost,total,split:true}`, or
+     *   undefined when no period rates are available.
+     */
+    function pricePeriods(periods, table, fallbackModel) {
+      if (periods === null || typeof periods !== 'object') return undefined;
+      const models = table !== null && typeof table === 'object' && table.models !== null && typeof table.models === 'object' ? table.models : {};
+      const rates = models[fallbackModel] ?? Object.values(models)[0];
+      if (rates === undefined) return undefined;
+      let cacheHitCost = 0;
+      let inputCost = 0;
+      let outputCost = 0;
+      let saw = false;
+      for (const period of ['peak', 'off']) {
+        const bucket = periods[period];
+        if (bucket === null || typeof bucket !== 'object') continue;
+        const rate = period === 'peak' ? rates.peak : rates.offPeak;
+        if (rate === undefined) continue;
+        const priced = priceTokens(bucket, rate);
+        cacheHitCost += priced.cacheHitCost;
+        inputCost += priced.inputCost;
+        outputCost += priced.outputCost;
+        saw = true;
+      }
+      if (!saw) return undefined;
+      return { cacheHitCost, inputCost, outputCost, total: cacheHitCost + inputCost + outputCost, split: true };
+    }
+
+    /**
+     * Convert dsh-context's raw cost buckets into the display's peak/off shape.
+     * This lets the peak/off rows show the full session even when the Host has
+     * only recorded the period split since its own process started.
+     */
+    function periodsFromCostUsage(usage) {
+      if (usage === null || typeof usage !== 'object') return undefined;
+      const periods = { peak: zeroTokens(), off: zeroTokens() };
+      let saw = false;
+      for (const provider of Object.values(usage)) {
+        if (provider === null || typeof provider !== 'object') continue;
+        for (const model of Object.values(provider)) {
+          if (model === null || typeof model !== 'object') continue;
+          for (const period of ['peak', 'off']) {
+            const bucket = model[period];
+            if (bucket === null || typeof bucket !== 'object') continue;
+            const target = periods[period];
+            target.inputTokens += typeof bucket.uncached === 'number' ? bucket.uncached : 0;
+            target.cacheReadTokens += typeof bucket.cacheRead === 'number' ? bucket.cacheRead : 0;
+            target.cacheWriteTokens += typeof bucket.cacheWrite === 'number' ? bucket.cacheWrite : 0;
+            target.outputTokens += typeof bucket.output === 'number' ? bucket.output : 0;
+            saw = true;
+          }
+        }
+      }
+      return saw ? periods : undefined;
+    }
+
     /** Group digits for readability: `1234567` → `1,234,567`. */
     function count(value) {
       const number = typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : 0;
@@ -1617,19 +1713,42 @@ window.__ModuleLoader__.load({
         const at = typeof record.endedAt === 'number' ? record.endedAt : record.startedAt;
         return typeof at === 'number' && at >= todayStart;
       });
-      const todayTokens = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, requests: 0 };
+      const todayTokens = zeroTokens();
+      const todayPeriods = { peak: zeroTokens(), off: zeroTokens() };
+      const todayLoose = zeroTokens();
+      let todayHasPeriods = false;
       for (const record of today) {
         const bucket = record.tokens;
-        if (bucket === null || typeof bucket !== 'object') continue;
-        todayTokens.inputTokens += bucket.inputTokens ?? 0;
-        todayTokens.outputTokens += bucket.outputTokens ?? 0;
-        todayTokens.cacheReadTokens += bucket.cacheReadTokens ?? 0;
-        todayTokens.cacheWriteTokens += bucket.cacheWriteTokens ?? 0;
-        todayTokens.reasoningTokens += bucket.reasoningTokens ?? 0;
-        todayTokens.requests += bucket.requests ?? 0;
+        if (bucket !== null && typeof bucket === 'object') addBuckets(todayTokens, bucket);
+        if (record.periods !== null && typeof record.periods === 'object') {
+          addBuckets(todayPeriods.peak, record.periods.peak);
+          addBuckets(todayPeriods.off, record.periods.off);
+          todayHasPeriods = true;
+        } else if (bucket !== null && typeof bucket === 'object') {
+          addBuckets(todayLoose, bucket);
+        }
       }
       const todayBilled = tokensTotal(todayTokens);
-      const todayCost = priceTokens(todayTokens, rate);
+      const todayPeriodCost = todayHasPeriods ? pricePeriods(todayPeriods, table, model) : undefined;
+      const todayLooseCost = priceTokens(todayLoose, rate);
+      const todayCost = todayPeriodCost === undefined || (todayPeriodCost.total === 0 && tokensTotal(todayLoose) === 0 && todayBilled > 0)
+        ? priceTokens(todayTokens, rate)
+        : {
+            cacheHitCost: todayPeriodCost.cacheHitCost + todayLooseCost.cacheHitCost,
+            inputCost: todayPeriodCost.inputCost + todayLooseCost.inputCost,
+            outputCost: todayPeriodCost.outputCost + todayLooseCost.outputCost,
+            total: todayPeriodCost.total + todayLooseCost.total,
+            split: true,
+            partial: tokensTotal(todayLoose) > 0,
+          };
+      const todayPartial = todayHasPeriods && tokensTotal(todayLoose) > 0;
+      const hasPeriods = session.periods !== null && typeof session.periods === 'object';
+      const peakBucket = hasPeriods ? session.periods.peak : undefined;
+      const offBucket = hasPeriods ? session.periods.off : undefined;
+      const peakRate = table?.models?.[model]?.peak ?? rate;
+      const offRate = table?.models?.[model]?.offPeak ?? rate;
+      const peakTokens = peakBucket === undefined ? 0 : tokensTotal(peakBucket);
+      const offTokens = offBucket === undefined ? 0 : tokensTotal(offBucket);
 
       /** One label/value row inside the grid. */
       const row = (label, value, extra) =>
@@ -1775,9 +1894,30 @@ window.__ModuleLoader__.load({
           h(
             'span',
             { className: `${PREFIX}-note` },
-            cost.split ? '按请求时段 · mixed' : peak ? '高峰价 peak' : '低谷价 off-peak',
+            cost.split ? (cost.partial ? '部分时段 · partial' : '按请求时段 · mixed') : peak ? '高峰价 peak' : '低谷价 off-peak',
           ),
         ),
+        hasPeriods && (peakTokens > 0 || offTokens > 0)
+          ? h(
+              'div',
+              null,
+              h('div', { className: `${PREFIX}-sectsub` }, '峰谷用量 · Peak / off-peak'),
+              h(
+                'div',
+                { className: `${PREFIX}-kv` },
+                h('span', { className: `${PREFIX}-k` }, '高峰 token Peak'),
+                h('span', { className: `${PREFIX}-v` }, count(peakTokens)),
+                h('span', { className: `${PREFIX}-note` }, money(priceTokens(peakBucket ?? {}, peakRate).total, symbol)),
+              ),
+              h(
+                'div',
+                { className: `${PREFIX}-kv` },
+                h('span', { className: `${PREFIX}-k` }, '低谷 token Off-peak'),
+                h('span', { className: `${PREFIX}-v` }, count(offTokens)),
+                h('span', { className: `${PREFIX}-note` }, money(priceTokens(offBucket ?? {}, offRate).total, symbol)),
+              ),
+            )
+          : null,
         h('div', { className: `${PREFIX}-sectsub` }, '今日用量 · Today'),
         h(
           'div',
@@ -1791,12 +1931,16 @@ window.__ModuleLoader__.load({
           { className: `${PREFIX}-kv` },
           h('span', { className: `${PREFIX}-k` }, '今日估算费用 Estimated'),
           h('span', { className: `${PREFIX}-v` }, todayBilled > 0 ? money(todayCost.total, symbol) : '—'),
-          h('span', { className: `${PREFIX}-note` }, '按当前费率'),
+          h(
+            'span',
+            { className: `${PREFIX}-note` },
+            todayPartial ? '部分按当前时段' : todayHasPeriods ? '按请求峰/谷' : '按当前费率',
+          ),
         ),
         h(
           'div',
           { className: `${PREFIX}-note ${PREFIX}-acctnote` },
-          '今日统计基于宠物保留的交互记录（最多 80 条），跨会话汇总；费用按当前选择的模型费率估算。',
+          '今日统计基于宠物保留的交互记录（最多 80 条），跨会话汇总；有峰/谷记录时按请求时段计价，缺失时段的按当前费率补估。',
         ),
         h(
           'div',
@@ -1809,7 +1953,14 @@ window.__ModuleLoader__.load({
           session.source === 'client'
             ? h('span', null, h('br'), '数据来源：浏览器会话投影（主机端尚未上报，因此没有分次明细与请求次数）。')
             : session.source === 'merged'
-              ? h('span', null, h('br'), 'Token 来自浏览器完整会话投影；交互明细为主机启动后记录，可能不完整。')
+              ? h(
+                  'span',
+                  null,
+                  h('br'),
+                  session.periodsSource === 'context'
+                    ? 'Token 与峰/谷分桶来自浏览器完整投影；交互明细为主机启动后记录。'
+                    : 'Token 来自浏览器完整会话投影；交互明细与峰/谷分桶为主机启动后记录，可能不完整。',
+                )
               : null,
         ),
         records.length > 0
@@ -1819,8 +1970,14 @@ window.__ModuleLoader__.load({
               '每次交互 · Per interaction',
             )
           : null,
-        records.slice(0, 12).map((record) =>
-          h(
+        records.slice(0, 12).map((record) => {
+          const splitRecord = record.tokens === undefined ? undefined : pricePeriods(record.periods, table, model);
+          const recordCost = record.tokens === undefined
+            ? undefined
+            : splitRecord !== undefined && (splitRecord.total > 0 || tokensTotal(record.tokens) === 0)
+              ? splitRecord
+              : priceTokens(record.tokens, rate);
+          return h(
             'div',
             { className: `${PREFIX}-kv`, key: `tok-${record.sessionId}-${record.startedAt}` },
             h(
@@ -1836,12 +1993,12 @@ window.__ModuleLoader__.load({
             h(
               'span',
               { className: `${PREFIX}-note` },
-              record.tokens === undefined
+              recordCost === undefined
                 ? ''
-                : `${money(priceTokens(record.tokens, rate).total, symbol)} · ${duration(record.durationMs)}`,
+                : `${money(recordCost.total, symbol)} · ${duration(record.durationMs)}`,
             ),
-          ),
-        ),
+          );
+        }),
       );
     }
 
@@ -2523,8 +2680,38 @@ window.__ModuleLoader__.load({
        */
       const accountingCost = useMemo(() => {
         const split = priceCostUsage(context?.cost, rateTable, rateModel);
-        return split ?? priceTokens(accountingSession?.tokens ?? {}, rate);
+        if (split !== undefined) return split;
+
+        // No dsh-context cost projection: use the Host's own peak/off buckets.
+        // The Host may have started mid-session, so the unrecorded remainder is
+        // priced at the currently active period and marked partial rather than
+        // pretending the whole session happened now.
+        const periodCost = pricePeriods(accountingSession?.periods, rateTable, rateModel);
+        if (periodCost !== undefined) {
+          const rest = subtractBuckets(accountingSession?.tokens ?? {}, periodsTokens(accountingSession.periods));
+          if (tokensTotal(rest) > 0) {
+            const extra = priceTokens(rest, rate);
+            return {
+              cacheHitCost: periodCost.cacheHitCost + extra.cacheHitCost,
+              inputCost: periodCost.inputCost + extra.inputCost,
+              outputCost: periodCost.outputCost + extra.outputCost,
+              total: periodCost.total + extra.total,
+              split: true,
+              partial: true,
+            };
+          }
+          return periodCost;
+        }
+        return priceTokens(accountingSession?.tokens ?? {}, rate);
       }, [accountingSession, context, rate, rateTable, rateModel]);
+
+      /** The session row the card renders, with the fullest peak/off split available. */
+      const displaySession = useMemo(() => {
+        if (accountingSession === undefined) return accountingSession;
+        const fromContext = periodsFromCostUsage(context?.cost);
+        if (fromContext === undefined) return accountingSession;
+        return { ...accountingSession, periods: fromContext, periodsSource: 'context' };
+      }, [accountingSession, context]);
 
       // Load the active session's projections once when the session changes, not
       // only when the panel opens: the context card should populate from a cold start
@@ -2775,7 +2962,7 @@ window.__ModuleLoader__.load({
                 onOpenInsights: openContextInsights,
                 onOpenRecord: openRecord,
                 accounting: {
-                  session: accountingSession,
+                  session: displaySession,
                   records: accountingRecords,
                   todayRecords: records,
                   requests: context?.steps || accountingSession?.tokens?.requests || 0,

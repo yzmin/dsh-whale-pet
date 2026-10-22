@@ -3,7 +3,7 @@
 | 项 | 值 |
 |---|---|
 | 被分析版本 | `dsh-whale-pet@1.0.0`（profile 中由 GitHub tarball 安装） |
-| 优化版本 | `1.3.4`（客户端 `id` 修正 + 完整 token 投影 + 当前会话账本） |
+| 优化版本 | `1.4.0`（峰谷时间分桶 + 客户端 `id` 修正 + 完整 token 投影） |
 | 对照插件 | `dsh-context@0.73.3` |
 | 运行环境 | DeepSeek Harness Web GUI（profile `desktop`） |
 | 改动范围 | Host `index.js`（待授权折叠）+ Browser `client.js`（上下文面板 / 紧急音 / 轮询） |
@@ -48,6 +48,7 @@
 | 9 | **“本会话”的计数与明细实际是全局记录** | `AccountSection` 使用全局 `records`（所有会话，最多 80 条），因此“33 次交互”和下方明细可能混入子代理 / 其他会话；“本会话时长”其实是 `now - SessionHeader.createdAt`，包含空闲，不是实际工作时长。 | 主视图会话优先；按 `sessionId` 过滤计数与明细；标签改为“会话年龄（含空闲）”并新增“交互耗时”（已结算记录之和）。 |
 | 10 | **Host 的 token 总量只从本插件进程启动后开始折叠** | 长会话在 DSH 重启后，Host `sessionTotals` 只包含重启后的用量。实测当前会话 Host 为 `43,681,717`，而持久日志为 `139,047,233`（406 次请求）；账本因此明显偏低，和 dsh-context 的完整投影不一致。 | 当前会话优先读浏览器 `tokenUsage` 完整投影，Host 行只保留 label / 请求数 / 明细；卡片注明“Token 来自完整投影，交互明细为主机启动后记录”。 |
 | 11 | **客户端会话列表行用 `id`，代码却读 `sessionId`** | `useSessions` 快照的每一行是 `{ id, title, retainedBy, ... }`；`activeSessionId` 用 `row.retainedBy.mainView` 找到行后取 `row.sessionId`，恒为 `undefined`，于是退回 `runningKey` / “花费最多”的会话。当前窗口明明打开 A 会话，宠物却显示 B。 | 所有列表行统一读 `row.id ?? row.sessionId`；标签读 `row.title ?? row.displayTitle`；新增 `id` 形状的渲染测试。 |
+| 12 | **费用按单一“当前时段”估算** | Host 只存会话 token 总量，没有记录每个请求发生在高峰还是低谷；跨时段的会话会把所有 token 按渲染时的时段计价，误差可能很大。 | Host 对每个 `assistant/message` 按事件时间落入 `peak` / `off` 桶，session 与 record 都带 `periods`；客户端优先用 dsh-context 的完整峰谷分桶，其次用 Host 的 `periods`，并把未记录的历史部分按当前时段补估且标注 partial；快照升到 v5。 |
 
 ---
 
@@ -178,7 +179,7 @@ Browser 半侧：
 
 所以 `120m 02s` 是“这个会话从创建到现在过了 2 小时”，不是“工作了 2 小时”；实际交互耗时看新增的那一行。
 
-**当前会话与今日统计（v1.3.4）：**
+**当前会话与今日统计（v1.4.0）：**
 
 - 本会话与 Context 卡片共用同一个 `activeSessionId`（主视图会话，其次运行中会话），不会再出现“账本显示另一个会话、Context 显示当前会话”；
 - `useSessions` 快照行按 `row.id` 读取（Host 行才用 `sessionId`），修掉主视图查找恒为 `undefined`、退回运行中 / 花费最多会话的问题；
@@ -186,10 +187,25 @@ Browser 半侧：
 - 当前会话即使已在 Host 快照中，token 仍优先读浏览器 `tokenUsage` **完整投影**，Host 只提供 label / 请求数 / 交互明细；长会话不会因为 DSH 重启而少算重启前的历史；
 - 卡片顶部显示会话标签和“Token 来自完整投影，交互明细为主机启动后记录”的说明；
 - 新增 **今日用量 · Today**：以本地零点过滤宠物记录，跨会话汇总今日计费 token、交互次数和估算费用；受 80 条记录窗口限制；
-- 费用优先读 dsh-context `contextTimeline.cost` 的 peak / off 分桶，按每次请求所属时段的费率计价；没有该投影时，才按当前时段对完整 token 估算；
+- 费用优先读 dsh-context `contextTimeline.cost` 的 peak / off 分桶；没有该投影时用 Host 的 `periods`，Host 启动前的缺口按当前时段补估并标注 partial；两者都没有时才全部按当前时段估算；
 - 费用仍按本地费率表估算；dsh-context 的 Context Stats 使用 models.dev 价目，二者可能不同，卡片里已注明。
 
 实测当前会话：Host 快照 `43,681,717` token（重启后累计），持久日志 `152,654,229` token / 436 次请求。采用完整投影后，token 与持久日志一致；金额则是按本地费率对完整 token 的估算，不是 provider 账单。
+
+### 3.10 峰谷时间分桶（v1.4.0）
+
+只有总量没有发生时间，跨高峰/低谷的会话无法准确计价。现在的链路是：
+
+| 层 | 记录内容 |
+|---|---|
+| Host | 每个 `step/start` 按北京时间判断：周一至周五 09–12、14–18 为 `peak`，其余为 `off`；该步的 usage 落到对应桶（没有 step 时用 `assistant/message` 时间兜底）；episode/session 都累计 `periods.peak` / `periods.off` |
+| Record | 每个交互记录也带 `periods`，所以“每次交互”的费用可以按它自己的时段算，而不是按渲染时时段 |
+| Snapshot | `version: 5`；每个 session 行增加 `periods` 和 `periodsFrom` |
+| Client | 优先用 dsh-context `contextTimeline.cost` 的完整 peak/off 分桶；没有时用 Host `periods`；Host 启动前的历史缺口按当前时段补估，并标注 `partial` |
+
+峰/谷窗口按北京时间工作日 09–12、14–18；周末按低谷。中国法定节假日没有单独建模，节假日请求会被当作高峰，卡片已注明可能高估。
+
+Host 的 `periods` 只覆盖本插件进程启动后的请求；要让当前长会话的历史也精确，仍依赖 dsh-context 的完整 `contextTimeline.cost`。Host v5 需要重启一次 DSH 才会开始记录新字段。
 
 ---
 

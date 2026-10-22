@@ -130,6 +130,41 @@ function cloneTokens(tokens) {
   return copy;
 }
 
+/** A zeroed peak/off-peak pair, so every request can be priced by its own period. */
+function emptyPeriods() {
+  return { peak: emptyTokens(), off: emptyTokens() };
+}
+
+/** Deep-copy a peak/off pair. */
+function clonePeriods(periods) {
+  return {
+    peak: cloneTokens(periods?.peak ?? emptyTokens()),
+    off: cloneTokens(periods?.off ?? emptyTokens()),
+  };
+}
+
+/**
+ * Whether an event time falls in DeepSeek's peak billing window.
+ *
+ * Beijing time, Monday–Friday, 09:00–12:00 and 14:00–18:00. Weekends are
+ * off-peak; statutory holidays are not modelled here, so a holiday request is
+ * classified as peak and the estimate can be high (the UI says so).
+ *
+ * @param time - epoch milliseconds from the session event.
+ */
+function isPeakTime(time) {
+  if (typeof time !== 'number' || !Number.isFinite(time)) return false;
+  const beijing = new Date(time + 8 * 60 * 60 * 1000);
+  const day = beijing.getUTCDay();
+  const hour = beijing.getUTCHours();
+  return day >= 1 && day <= 5 && ((hour >= 9 && hour < 12) || (hour >= 14 && hour < 18));
+}
+
+/** The pricing bucket for one event time. */
+function periodKey(time) {
+  return isPeakTime(time) ? 'peak' : 'off';
+}
+
 /**
  * Optional Host service lookup.
  *
@@ -350,7 +385,13 @@ export function apply(ctx) {
   const totalsOf = (sessionId) => {
     let entry = sessionTotals.get(sessionId);
     if (entry === undefined) {
-      entry = { startedAt: undefined, lastEventAt: undefined, tokens: emptyTokens() };
+      entry = {
+        startedAt: undefined,
+        lastEventAt: undefined,
+        periodsFrom: undefined,
+        tokens: emptyTokens(),
+        periods: emptyPeriods(),
+      };
       sessionTotals.set(sessionId, entry);
     }
     return entry;
@@ -373,6 +414,11 @@ export function apply(ctx) {
   const mergeTokens = (target, source) => {
     for (const key of TOKEN_KEYS) target[key] += source[key];
     target.requests += source.requests;
+  };
+  /** Merge a peak/off pair into another. */
+  const mergePeriods = (target, source) => {
+    mergeTokens(target.peak, source.peak);
+    mergeTokens(target.off, source.off);
   };
 
   const feed_ = (kind, text, sessionId) => {
@@ -434,6 +480,7 @@ export function apply(ctx) {
         steps: 0,
         error: undefined,
         tokens: emptyTokens(),
+        periods: emptyPeriods(),
       };
       open.set(sessionId, episode);
     }
@@ -452,8 +499,12 @@ export function apply(ctx) {
     open.delete(sessionId);
     if (episode === undefined) return;
     // Fold the episode's in-flight buckets into the session total exactly once,
-    // here, at the moment it stops being live.
-    mergeTokens(totalsOf(sessionId).tokens, episode.tokens);
+    // here, at the moment it stops being live. The peak/off split is folded with
+    // the same rule so the cost estimate can price each request by its own period.
+    const totals = totalsOf(sessionId);
+    mergeTokens(totals.tokens, episode.tokens);
+    if (totals.periods === undefined) totals.periods = emptyPeriods();
+    mergePeriods(totals.periods, episode.periods ?? emptyPeriods());
     pushRecord({
       id: nextId,
       sessionId,
@@ -467,6 +518,7 @@ export function apply(ctx) {
       turns: episode.turns,
       steps: episode.steps,
       tokens: cloneTokens(episode.tokens),
+      periods: clonePeriods(episode.periods),
       ...episode.error === undefined ? {} : { error: episode.error },
     });
     nextId += 1;
@@ -513,7 +565,24 @@ export function apply(ctx) {
         // Provider-reported usage rides on the settlement. It counts toward the
         // episode only; settling folds it into the session total, which keeps the
         // two disjoint so the snapshot can present their sum without double-counting.
-        if (data?.usage !== undefined) addUsage(episode.tokens, data.usage);
+        // The same sample also lands in the event's own peak/off bucket, because a
+        // session can span both periods and a single blended rate would be wrong.
+        // Prefer the step/request start period: a request that starts at 11:59 and
+        // finishes at 12:01 is billed by when it ran, not when the reply landed.
+        if (data?.usage !== undefined) {
+          addUsage(episode.tokens, data.usage);
+          if (episode.periods === undefined) episode.periods = emptyPeriods();
+          const period = episode.pendingPeriod ?? periodKey(now);
+          addUsage(episode.periods[period], data.usage);
+          episode.pendingPeriod = undefined;
+          const totals = totalsOf(sessionId);
+          if (totals.periodsFrom === undefined) totals.periodsFrom = now;
+        }
+        break;
+      }
+      case 'step/start': {
+        const episode = episodeOf(sessionId, now);
+        episode.pendingPeriod = periodKey(now);
         break;
       }
       case 'turn/start': {
@@ -663,6 +732,8 @@ export function apply(ctx) {
           for (const key of TOKEN_KEYS) tokens[key] += live.tokens[key];
           tokens.requests += live.tokens.requests;
         }
+        const periods = entry.periods === undefined ? emptyPeriods() : clonePeriods(entry.periods);
+        if (live !== undefined && live.periods !== undefined) mergePeriods(periods, live.periods);
         const startedAt = entry.startedAt;
         const lastEventAt = entry.lastEventAt ?? live?.startedAt;
         // A clamp as well as a normalization: even a correctly-built timestamp
@@ -679,6 +750,8 @@ export function apply(ctx) {
           idleMs: lastEventAt === undefined ? undefined : Math.max(0, now - lastEventAt),
           running: running.get(sessionId) === true,
           tokens,
+          periods,
+          periodsFrom: entry.periodsFrom,
           totalTokens: tokensTotal(tokens),
         });
       } catch (error) {
@@ -700,7 +773,7 @@ export function apply(ctx) {
     approvalRows.sort((left, right) => right.askedAt - left.askedAt);
 
     return {
-      version: 4,
+      version: 5,
       now,
       busy: active.length > 0,
       active,
