@@ -1173,6 +1173,7 @@ window.__ModuleLoader__.load({
 .${PREFIX}-ctxfoot .${PREFIX}-btn{flex:none}
 .${PREFIX}-secthead{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11.5px;font-weight:600;margin-bottom:4px}
 .${PREFIX}-secthead .${PREFIX}-note{font-weight:400}
+.${PREFIX}-sesslabel{font-size:10.5px;color:var(--dsw-alias-label-secondary,#6b7280);margin:-2px 0 4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .${PREFIX}-sectsub{font-size:10.5px;font-weight:600;color:var(--dsw-alias-label-secondary,#6b7280);margin:7px 0 2px;letter-spacing:.02em}
 .${PREFIX}-kv{display:grid;grid-template-columns:1fr auto auto;align-items:baseline;gap:8px;font-size:11.5px;line-height:1.5}
 .${PREFIX}-k{color:var(--dsw-alias-label-secondary,#6b7280);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -1528,7 +1529,7 @@ window.__ModuleLoader__.load({
      * so the per-episode rows and the session total are priced by the same rule
      * and always agree.
      */
-    function AccountSection({ session, records, cost, rate, model, models, table, currency, symbol, peak, balance, onModel, onCurrency }) {
+    function AccountSection({ session, records, todayRecords, cost, rate, model, models, table, currency, symbol, peak, balance, onModel, onCurrency }) {
       if (session === undefined || session.tokens === undefined) {
         return h(
           'div',
@@ -1560,6 +1561,28 @@ window.__ModuleLoader__.load({
         (sum, record) => sum + (typeof record.durationMs === 'number' && Number.isFinite(record.durationMs) ? Math.max(0, record.durationMs) : 0),
         0,
       );
+
+      /** Calendar-day rollup across all sessions the pet has records for. */
+      const dayStart = new Date();
+      dayStart.setHours(0, 0, 0, 0);
+      const todayStart = dayStart.getTime();
+      const today = (Array.isArray(todayRecords) ? todayRecords : records).filter((record) => {
+        const at = typeof record.endedAt === 'number' ? record.endedAt : record.startedAt;
+        return typeof at === 'number' && at >= todayStart;
+      });
+      const todayTokens = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, requests: 0 };
+      for (const record of today) {
+        const bucket = record.tokens;
+        if (bucket === null || typeof bucket !== 'object') continue;
+        todayTokens.inputTokens += bucket.inputTokens ?? 0;
+        todayTokens.outputTokens += bucket.outputTokens ?? 0;
+        todayTokens.cacheReadTokens += bucket.cacheReadTokens ?? 0;
+        todayTokens.cacheWriteTokens += bucket.cacheWriteTokens ?? 0;
+        todayTokens.reasoningTokens += bucket.reasoningTokens ?? 0;
+        todayTokens.requests += bucket.requests ?? 0;
+      }
+      const todayBilled = tokensTotal(todayTokens);
+      const todayCost = priceTokens(todayTokens, rate);
 
       /** One label/value row inside the grid. */
       const row = (label, value, extra) =>
@@ -1602,6 +1625,11 @@ window.__ModuleLoader__.load({
               Object.keys(models).map((key) => h('option', { key, value: key }, models[key].label)),
             ),
           ),
+        ),
+        h(
+          'div',
+          { className: `${PREFIX}-sesslabel` },
+          `会话 · ${session.label !== undefined && session.label !== '' ? session.label : shortId(session.sessionId ?? '')}`,
         ),
         /* Even with no numbers yet the STRUCTURE is shown, so the block reads as
            "not settled yet" rather than "broken". provider usage only exists once
@@ -1703,12 +1731,34 @@ window.__ModuleLoader__.load({
             peak ? '高峰价 peak' : '低谷价 off-peak',
           ),
         ),
+        h('div', { className: `${PREFIX}-sectsub` }, '今日用量 · Today'),
+        h(
+          'div',
+          { className: `${PREFIX}-kv` },
+          h('span', { className: `${PREFIX}-k` }, '今日计费 token Billed'),
+          h('span', { className: `${PREFIX}-v` }, todayBilled > 0 ? count(todayBilled) : '—'),
+          h('span', { className: `${PREFIX}-note` }, `${today.length} 次交互 · 跨会话`),
+        ),
+        h(
+          'div',
+          { className: `${PREFIX}-kv` },
+          h('span', { className: `${PREFIX}-k` }, '今日估算费用 Estimated'),
+          h('span', { className: `${PREFIX}-v` }, todayBilled > 0 ? money(todayCost.total, symbol) : '—'),
+          h('span', { className: `${PREFIX}-note` }, '按当前费率'),
+        ),
+        h(
+          'div',
+          { className: `${PREFIX}-note ${PREFIX}-acctnote` },
+          '今日统计基于宠物保留的交互记录（最多 80 条），跨会话汇总；费用按当前选择的模型费率估算。',
+        ),
         h(
           'div',
           { className: `${PREFIX}-note ${PREFIX}-acctnote` },
           `价格 ${models[model].label}（${table.label}）：缓存命中 ${symbol}${rate.hit}/M · 未命中 ${symbol}${rate.miss}/M · 输出 ${symbol}${rate.output}/M（每 1M token）`,
           h('br'),
           '高峰时段为北京时间周一至周五 09–12、14–18 点（即 UTC 01–04、06–10）；中国法定节假日按低谷计费，此处未扣除，因此节假日可能高估。',
+          h('br'),
+          '费用为本地费率估算；dsh-context 的 Context Stats 使用 models.dev 价目，估算结果可能与此处不同。',
           session.source === 'client'
             ? h('span', null, h('br'), '数据来源：浏览器会话投影（主机端尚未上报，因此没有分次明细与请求次数）。')
             : null,
@@ -2308,53 +2358,58 @@ window.__ModuleLoader__.load({
         };
       }, [clientTokensFallback, hostState.sessions]);
       /**
-       * The session whose accounting is shown: the conversation in the main view.
+       * The session currently in the center column: the main-view retain first,
+       * then any running session for a page with no conversation selected.
+       */
+      const activeSessionId = useMemo(() => {
+        const main = Object.values(listSnapshot?.byId ?? {}).find((row) => (row?.retainedBy?.mainView ?? 0) > 0)?.sessionId;
+        if (main !== undefined) return main;
+        return runningKey.split('\u0000').filter(Boolean)[0];
+      }, [listSnapshot, runningKey]);
+
+      /**
+       * The session whose accounting is shown: exactly the session above.
        *
-       * The main-view retain count is the authoritative "currently open" signal;
-       * only when nothing is open does the card fall back to the newest session
-       * with spend. Subagents also accrue tokens, so picking the spendiest row
-       * first would silently show a child's bill under a "this session" label.
-       *
-       * When the Host reported no tokens at all — a stale Host module, or a
-       * composition without it — fall back to the browser's own `tokenUsage`
-       * projection so the block still answers the question instead of going dark.
+       * If the current session is not in the Host snapshot yet, use the browser's
+       * own `tokenUsage` projection and a synthetic row — NOT another session's
+       * bill. The old fallback to "newest session with spend" is what made a
+       * subagent or another conversation appear under a "this session" label.
        */
       const accountingSession = useMemo(() => {
         const rows = hostState.sessions ?? [];
-        const active = Object.values(listSnapshot?.byId ?? {}).find((row) => (row?.retainedBy?.mainView ?? 0) > 0)?.sessionId;
-        const activeRow = active === undefined ? undefined : rows.find((row) => row.sessionId === active);
-        if (activeRow !== undefined) return activeRow;
+        if (activeSessionId !== undefined) {
+          const activeRow = rows.find((row) => row.sessionId === activeSessionId);
+          if (activeRow !== undefined) return activeRow;
+          if (clientFallbackSession?.sessionId === activeSessionId) return clientFallbackSession;
 
-        const withSpend = rows.find((row) => row.totalTokens > 0);
-        if (withSpend !== undefined) return withSpend;
-
-        // No Host tokens: fall back to the browser's own projection. The session
-        // to read is the one retained by the main view — the conversation the
-        // user is looking at — then any row the Host did report, then any
-        // running session.
-        const targetId = active ?? rows[0]?.sessionId ?? runningKey.split('\u0000').filter(Boolean)[0];
-        const clientTokens = readClientTokens(servicesRef.current?.get?.('sessions'), targetId);
-        if (clientTokens !== undefined) {
-          const row = rows.find((entry) => entry.sessionId === targetId);
+          const listRow = listSnapshot?.byId?.[activeSessionId];
+          const clientTokens = readClientTokens(servicesRef.current?.get?.('sessions'), activeSessionId);
           return {
-            ...(row ?? { sessionId: targetId, label: shortId(targetId) }),
-            tokens: clientTokens,
-            totalTokens: tokensTotal(clientTokens),
+            sessionId: activeSessionId,
+            label: listRow?.displayTitle ?? listRow?.title ?? shortId(activeSessionId),
+            elapsedMs: undefined,
+            totalTokens: clientTokens === undefined ? 0 : tokensTotal(clientTokens),
+            tokens: clientTokens ?? { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, requests: 0 },
             source: 'client',
           };
         }
-        // Still nothing: fall back to the retried read, then to a zeroed row so
-        // the block can render its structure instead of disappearing.
+
+        // No current session selected: fall back to the newest session with spend,
+        // then to the browser-side projection, then to a zeroed row.
+        const withSpend = rows.find((row) => row.totalTokens > 0);
+        if (withSpend !== undefined) return withSpend;
         if (clientFallbackSession !== undefined) return clientFallbackSession;
+        const row = rows[0];
         return {
-          sessionId: targetId,
-          label: shortId(targetId ?? ''),
-          elapsedMs: undefined,
-          totalTokens: 0,
-          tokens: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, requests: 0 },
-          source: 'client',
+          ...(row ?? {}),
+          sessionId: row?.sessionId ?? '',
+          label: row?.label ?? '',
+          elapsedMs: row?.elapsedMs,
+          totalTokens: row?.totalTokens ?? 0,
+          tokens: row?.tokens ?? { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, requests: 0 },
+          source: row?.source ?? 'client',
         };
-      }, [hostState.sessions, listSnapshot, runningKey, clientFallbackSession]);
+      }, [hostState.sessions, listSnapshot, activeSessionId, clientFallbackSession]);
 
       /**
        * The ledger rows belonging to the accounting session.
@@ -2376,19 +2431,14 @@ window.__ModuleLoader__.load({
       /**
        * The session whose context the panel tracks.
        *
-       * Occupancy is about the conversation the user is LOOKING AT, not the
-       * session with the most spend: a busy subagent can outspend its parent.
-       * The main-view retain count is the authoritative "currently open in the
-       * center column" signal; a running session, then the accounting row, are
-       * only fallbacks for a page with no conversation selected.
+       * Use the same target as the accounting card so the two can never show
+       * different conversations. `activeSessionId` already prefers the main-view
+       * retain, then a running session.
        */
-      const contextTargetId = useMemo(() => {
-        const main = Object.values(listSnapshot?.byId ?? {}).find((row) => (row?.retainedBy?.mainView ?? 0) > 0)?.sessionId;
-        if (main !== undefined) return main;
-        const running = runningKey.split('\u0000').filter(Boolean)[0];
-        if (running !== undefined) return running;
-        return accountingSession?.sessionId;
-      }, [listSnapshot, runningKey, accountingSession]);
+      const contextTargetId = useMemo(
+        () => activeSessionId ?? accountingSession?.sessionId,
+        [activeSessionId, accountingSession],
+      );
 
       /**
        * Live context reading. Re-read when the Host poll lands, the open panel
@@ -2651,6 +2701,7 @@ window.__ModuleLoader__.load({
                 accounting: {
                   session: accountingSession,
                   records: accountingRecords,
+                  todayRecords: records,
                   cost: accountingCost,
                   rate,
                   model: rateModel,
