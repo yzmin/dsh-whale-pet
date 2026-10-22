@@ -2720,14 +2720,16 @@ window.__ModuleLoader__.load({
         const contextPeriods = periodsFromCostUsage(context?.cost);
         const contextTotal = contextPeriods === undefined ? 0 : tokensTotal(periodsTokens(contextPeriods));
 
-        // Pick the candidate that covers the most tokens. A small context split
-        // (e.g. only a title-generation model) must not hide the Host's full
-        // off-peak bucket just because it appeared first.
+        // Host and records carry actual timestamps; prefer them over dsh-context.
+        // A context cost bucket can be a whole-session list-price bucket (all
+        // under `peak`) and must never hide a real off-peak Host/record split.
         const candidates = [];
         if (hostTotal > 0) candidates.push({ periods: hostPeriods, total: hostTotal, source: 'host' });
         if (recordTotal > 0) candidates.push({ periods: recordPeriods, total: recordTotal, source: 'records' });
-        if (contextTotal > 0) candidates.push({ periods: contextPeriods, total: contextTotal, source: 'context' });
         candidates.sort((left, right) => right.total - left.total);
+        if (candidates.length === 0 && contextTotal > 0) {
+          candidates.push({ periods: contextPeriods, total: contextTotal, source: 'context' });
+        }
         if (candidates.length === 0) return accountingSession;
         const best = candidates[0];
         return { ...accountingSession, periods: best.periods, periodsSource: best.source };
