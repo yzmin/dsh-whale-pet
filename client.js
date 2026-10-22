@@ -2221,7 +2221,8 @@ window.__ModuleLoader__.load({
           }
         } else if (listSnapshot?.byId !== undefined) {
           for (const row of Object.values(listSnapshot.byId)) {
-            if (row?.running === true) ids.push(row.sessionId);
+            const id = row?.id ?? row?.sessionId;
+            if (row?.running === true && typeof id === 'string') ids.push(id);
           }
         }
         return ids;
@@ -2242,9 +2243,9 @@ window.__ModuleLoader__.load({
           const row = listSnapshot?.byId?.[id];
           pending.set(id, {
             sessionId: id,
-            label: row?.displayTitle ?? row?.title ?? shortId(id),
+            label: row?.title ?? row?.displayTitle ?? shortId(id),
             startedAt: now,
-            prompt: row?.displayTitle ?? row?.title ?? '',
+            prompt: row?.title ?? row?.displayTitle ?? '',
           });
         }
         for (const [id, episode] of [...pending]) {
@@ -2315,9 +2316,9 @@ window.__ModuleLoader__.load({
                 const row = listSnapshot?.byId?.[id];
                 return {
                   sessionId: id,
-                  label: row?.displayTitle ?? row?.title ?? shortId(id),
+                  label: row?.title ?? row?.displayTitle ?? shortId(id),
                   startedAt: undefined,
-                  prompt: row?.displayTitle ?? row?.title ?? '',
+                  prompt: row?.title ?? row?.displayTitle ?? '',
                 };
               }),
         };
@@ -2369,7 +2370,8 @@ window.__ModuleLoader__.load({
         const rows = hostState.sessions ?? [];
         if (rows.some((row) => row.totalTokens > 0)) return undefined;
 
-        const active = Object.values(listSnapshot?.byId ?? {}).find((row) => (row?.retainedBy?.mainView ?? 0) > 0)?.sessionId;
+        const activeRow = Object.values(listSnapshot?.byId ?? {}).find((row) => (row?.retainedBy?.mainView ?? 0) > 0);
+        const active = activeRow?.id ?? activeRow?.sessionId;
         const targetId = active ?? rows[0]?.sessionId ?? runningKey.split('\u0000').filter(Boolean)[0];
         if (targetId === undefined) return undefined;
 
@@ -2411,8 +2413,9 @@ window.__ModuleLoader__.load({
        * then any running session for a page with no conversation selected.
        */
       const activeSessionId = useMemo(() => {
-        const main = Object.values(listSnapshot?.byId ?? {}).find((row) => (row?.retainedBy?.mainView ?? 0) > 0)?.sessionId;
-        if (main !== undefined) return main;
+        const mainRow = Object.values(listSnapshot?.byId ?? {}).find((row) => (row?.retainedBy?.mainView ?? 0) > 0);
+        const main = mainRow?.id ?? mainRow?.sessionId;
+        if (typeof main === 'string' && main !== '') return main;
         return runningKey.split('\u0000').filter(Boolean)[0];
       }, [listSnapshot, runningKey]);
 
@@ -2450,7 +2453,7 @@ window.__ModuleLoader__.load({
           const clientTokens = readClientTokens(servicesRef.current?.get?.('sessions'), activeSessionId);
           return {
             sessionId: activeSessionId,
-            label: listRow?.displayTitle ?? listRow?.title ?? shortId(activeSessionId),
+            label: listRow?.title ?? listRow?.displayTitle ?? shortId(activeSessionId),
             elapsedMs: undefined,
             totalTokens: clientTokens === undefined ? 0 : tokensTotal(clientTokens),
             tokens: clientTokens ?? { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, requests: 0 },
