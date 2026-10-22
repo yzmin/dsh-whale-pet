@@ -1,6 +1,6 @@
 {
   "name": "dsh-whale-pet",
-  "version": "1.2.3",
+  "version": "1.3.0",
   "private": true,
   "description": "An animated DeepSeek blue-whale pet that shows Harness working status, tracks the live context window with dsh-context insight, sounds an urgent alarm for pending approvals, chimes when work completes, and opens a panel listing every interaction.",
   "type": "module",

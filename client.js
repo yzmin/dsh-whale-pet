@@ -1125,7 +1125,11 @@ window.__ModuleLoader__.load({
 // keeps a row or two readable when the sections above are tall, without letting
 // the list dictate the panel's height.
 .${PREFIX}-list{padding:5px 0;min-height:220px}
-.${PREFIX}-row{display:flex;gap:9px;padding:8px 13px;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.06))}
+.${PREFIX}-row{display:flex;gap:9px;padding:8px 13px;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.06));transition:background .15s ease}
+.${PREFIX}-row[data-clickable="1"]{cursor:pointer}
+.${PREFIX}-row[data-clickable="1"]:hover{background:var(--dsw-alias-bg-layer-2,rgba(0,0,0,.04))}
+.${PREFIX}-row[data-clickable="1"]:focus-visible{outline:2px solid #4d6bfe;outline-offset:-2px;background:var(--dsw-alias-bg-layer-2,rgba(0,0,0,.04))}
+.${PREFIX}-openmark{margin-left:auto;font-size:11px;line-height:1;opacity:.55;color:var(--dsw-alias-label-secondary,#6b7280)}
 .${PREFIX}-row:last-child{border-bottom:0}
 .${PREFIX}-rail{width:2px;border-radius:1px;background:#4d6bfe;opacity:.55;flex:none}
 .${PREFIX}-row[data-error="1"] .${PREFIX}-rail{background:var(--dsw-alias-state-error-primary,#e5484d);opacity:.85}
@@ -1310,12 +1314,34 @@ window.__ModuleLoader__.load({
      * The panel
      * ------------------------------------------------------------------ */
 
-    /** One ledger row. */
-    function RecordRow({ record, index }) {
+    /** One ledger row. A row with a session can be activated to open it. */
+    function RecordRow({ record, index, onOpen }) {
       const hasError = typeof record.error === 'string' && record.error !== '';
+      const sessionId = typeof record.sessionId === 'string' ? record.sessionId : '';
+      const canOpen = sessionId !== '' && typeof onOpen === 'function';
+      const open = () => {
+        if (canOpen) onOpen(record);
+      };
       return h(
         'div',
-        { className: `${PREFIX}-row`, 'data-error': hasError ? '1' : undefined },
+        {
+          className: `${PREFIX}-row`,
+          'data-error': hasError ? '1' : undefined,
+          'data-clickable': canOpen ? '1' : undefined,
+          role: canOpen ? 'button' : undefined,
+          tabIndex: canOpen ? 0 : undefined,
+          onClick: canOpen ? open : undefined,
+          onKeyDown: canOpen
+            ? (event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault();
+                  open();
+                }
+              }
+            : undefined,
+          title: canOpen ? `打开对应对话 · Open ${record.label ?? 'conversation'}` : undefined,
+          'aria-label': canOpen ? `Open conversation ${record.label ?? sessionId}` : undefined,
+        },
         h('div', { className: `${PREFIX}-rail` }),
         h(
           'div',
@@ -1327,6 +1353,7 @@ window.__ModuleLoader__.load({
             h('span', null, clockTime(record.endedAt ?? record.startedAt ?? Date.now())),
             h('span', null, duration(record.durationMs)),
             record.origin === 'local' ? h('span', { className: `${PREFIX}-tag` }, 'local') : null,
+            canOpen ? h('span', { className: `${PREFIX}-openmark`, 'aria-hidden': 'true' }, '↗') : null,
           ),
           record.prompt === '' || record.prompt === undefined
             ? h('div', { className: `${PREFIX}-prompt ${PREFIX}-muted` }, '（未采集到提示词 · prompt not captured）')
@@ -1705,7 +1732,7 @@ window.__ModuleLoader__.load({
      * The expanded secondary page: what Harness is doing right now, and one row
      * per finished interaction.
      */
-    function Panel({ view, records, onClear, onClose, soundOn, onToggleSound, onPreviewSound, onPickTone, tone, canSound, accounting, context, onOpenInsights }) {
+    function Panel({ view, records, onClear, onClose, soundOn, onToggleSound, onPreviewSound, onPickTone, tone, canSound, accounting, context, onOpenInsights, onOpenRecord }) {
       const active = view.active;
       return h(
         'div',
@@ -1787,7 +1814,7 @@ window.__ModuleLoader__.load({
                   h('br'),
                   h('span', { className: `${PREFIX}-note` }, 'No interactions yet — send a prompt and a row appears here.'),
                 )
-              : records.map((record, index) => h(RecordRow, { key: `${record.sessionId ?? 'x'}-${record.startedAt ?? index}-${index}`, record, index })),
+              : records.map((record, index) => h(RecordRow, { key: `${record.sessionId ?? 'x'}-${record.startedAt ?? index}-${index}`, record, index, onOpen: onOpenRecord })),
           ),
         ),
         h(
@@ -2373,6 +2400,32 @@ window.__ModuleLoader__.load({
       }, [open, contextTargetId]);
 
       /**
+       * Open the conversation behind one interaction record.
+       *
+       * `uiWorkspace.openSession` is the public Client action that switches the
+       * center column to a session; `layout.selectPanel('conversation')` makes
+       * sure the conversation panel is the visible one if another main panel
+       * (Plugins, Context Insights, …) was selected. A session that has since
+       * been archived or disposed may refuse the jump, so a failure leaves the
+       * panel open rather than closing it onto nothing.
+       */
+      const openRecord = useCallback((record) => {
+        const sessionId = typeof record?.sessionId === 'string' ? record.sessionId : '';
+        if (sessionId === '') return;
+        try {
+          const services = servicesRef.current;
+          const workspace = services?.get?.('uiWorkspace');
+          if (typeof workspace?.openSession !== 'function') return;
+          workspace.openSession(sessionId);
+          const layout = services?.get?.('layout');
+          if (typeof layout?.selectPanel === 'function') layout.selectPanel('conversation');
+          setOpen(false);
+        } catch {
+          /* archived/disposed session: keep the panel so its row is not lost */
+        }
+      }, []);
+
+      /**
        * Jump to dsh-context's Context Insights page.
        *
        * `layout.selectPanel` is the public Client navigation action, and
@@ -2558,6 +2611,7 @@ window.__ModuleLoader__.load({
                 canSound: audioReady,
                 context,
                 onOpenInsights: openContextInsights,
+                onOpenRecord: openRecord,
                 accounting: {
                   session: accountingSession,
                   records,

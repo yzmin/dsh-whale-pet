@@ -3,7 +3,7 @@
 | 项 | 值 |
 |---|---|
 | 被分析版本 | `dsh-whale-pet@1.0.0`（profile 中由 GitHub tarball 安装） |
-| 优化版本 | `1.2.3`（单次权限提示 + 蓝色光晕 + 光环跟随） |
+| 优化版本 | `1.3.0`（记录跳转 + 单次权限提示 + 蓝色光晕） |
 | 对照插件 | `dsh-context@0.73.3` |
 | 运行环境 | DeepSeek Harness Web GUI（profile `desktop`） |
 | 改动范围 | Host `index.js`（待授权折叠）+ Browser `client.js`（上下文面板 / 紧急音 / 轮询） |
@@ -147,6 +147,15 @@ Browser 半侧：
 - `prefers-reduced-motion` 下三者的动画一起关闭。
 
 这样“转圈圈的光影”会跟着鲸鱼一起上下，而不会左右摆动或改变环的形状。
+
+### 3.8 记录跳转（v1.3.0）
+
+每条交互记录都携带 `sessionId`，现在整行可点击（也可用键盘）：
+
+- `RecordRow` → `onOpenRecord(record)` → `uiWorkspace.openSession(record.sessionId)`，把中央列切到该会话；
+- 随后 `layout.selectPanel('conversation')`，确保当前主面板是对话而不是插件页 / 上下文洞察页；
+- 只有两步都成功调用后才关闭宠物面板；会话已归档 / 已释放或服务缺失时保持面板打开，避免“点一下什么都没了”；
+- 可点击行带 `role="button"`、`tabIndex=0`、Enter / Space 激活、hover / focus 背景和右上角 `↗` 提示。
 
 ---
 
