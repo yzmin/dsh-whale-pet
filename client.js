@@ -1555,6 +1555,11 @@ window.__ModuleLoader__.load({
       const miss = t.inputTokens + t.cacheWriteTokens;
       const inputSide = hit + miss;
       const share = (value, whole) => (whole > 0 ? `${Math.round((value / whole) * 100)}%` : '0%');
+      /** Sum of the recorded episode windows, excluding idle gaps between them. */
+      const episodeMs = records.reduce(
+        (sum, record) => sum + (typeof record.durationMs === 'number' && Number.isFinite(record.durationMs) ? Math.max(0, record.durationMs) : 0),
+        0,
+      );
 
       /** One label/value row inside the grid. */
       const row = (label, value, extra) =>
@@ -1612,9 +1617,22 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: `${PREFIX}-kv` },
-          h('span', { className: `${PREFIX}-k` }, '本会话时长 Session'),
+          h('span', { className: `${PREFIX}-k` }, '会话年龄 Session age'),
           h('span', { className: `${PREFIX}-v` }, session.elapsedMs === undefined ? '—' : duration(session.elapsedMs)),
-          h('span', { className: `${PREFIX}-note` }, `${Math.round(records.length)} 次交互`),
+          h('span', { className: `${PREFIX}-note` }, '含空闲 · idle'),
+        ),
+        h(
+          'div',
+          { className: `${PREFIX}-kv` },
+          h('span', { className: `${PREFIX}-k` }, '交互耗时 Episode time'),
+          h('span', { className: `${PREFIX}-v` }, records.length === 0 ? '—' : duration(episodeMs)),
+          h(
+            'span',
+            { className: `${PREFIX}-note` },
+            records.length === 0 && session.totalTokens > 0
+              ? '记录已滚出窗口'
+              : `${Math.round(records.length)} 次交互`,
+          ),
         ),
         h(
           'div',
@@ -2290,10 +2308,12 @@ window.__ModuleLoader__.load({
         };
       }, [clientTokensFallback, hostState.sessions]);
       /**
-       * The newest session that has spend, then the newest session overall.
-       * Subagent sessions also accrue tokens and appear in the snapshot, so
-       * preferring one with spend keeps the panel showing the conversation the
-       * user is actually in rather than a transient child.
+       * The session whose accounting is shown: the conversation in the main view.
+       *
+       * The main-view retain count is the authoritative "currently open" signal;
+       * only when nothing is open does the card fall back to the newest session
+       * with spend. Subagents also accrue tokens, so picking the spendiest row
+       * first would silently show a child's bill under a "this session" label.
        *
        * When the Host reported no tokens at all — a stale Host module, or a
        * composition without it — fall back to the browser's own `tokenUsage`
@@ -2301,6 +2321,10 @@ window.__ModuleLoader__.load({
        */
       const accountingSession = useMemo(() => {
         const rows = hostState.sessions ?? [];
+        const active = Object.values(listSnapshot?.byId ?? {}).find((row) => (row?.retainedBy?.mainView ?? 0) > 0)?.sessionId;
+        const activeRow = active === undefined ? undefined : rows.find((row) => row.sessionId === active);
+        if (activeRow !== undefined) return activeRow;
+
         const withSpend = rows.find((row) => row.totalTokens > 0);
         if (withSpend !== undefined) return withSpend;
 
@@ -2308,7 +2332,6 @@ window.__ModuleLoader__.load({
         // to read is the one retained by the main view — the conversation the
         // user is looking at — then any row the Host did report, then any
         // running session.
-        const active = Object.values(listSnapshot?.byId ?? {}).find((row) => (row?.retainedBy?.mainView ?? 0) > 0)?.sessionId;
         const targetId = active ?? rows[0]?.sessionId ?? runningKey.split('\u0000').filter(Boolean)[0];
         const clientTokens = readClientTokens(servicesRef.current?.get?.('sessions'), targetId);
         if (clientTokens !== undefined) {
@@ -2332,6 +2355,19 @@ window.__ModuleLoader__.load({
           source: 'client',
         };
       }, [hostState.sessions, listSnapshot, runningKey, clientFallbackSession]);
+
+      /**
+       * The ledger rows belonging to the accounting session.
+       *
+       * The pet's record list is global (all sessions, capped at 80), but the
+       * accounting card is titled "this session". Without this filter the count
+       * and per-interaction list mix in subagents and other conversations.
+       */
+      const accountingRecords = useMemo(() => {
+        const sessionId = accountingSession?.sessionId;
+        if (typeof sessionId !== 'string' || sessionId === '') return [];
+        return records.filter((record) => record.sessionId === sessionId);
+      }, [records, accountingSession]);
       const accountingCost = useMemo(
         () => priceTokens(accountingSession?.tokens ?? {}, rate),
         [accountingSession, rate],
@@ -2614,7 +2650,7 @@ window.__ModuleLoader__.load({
                 onOpenRecord: openRecord,
                 accounting: {
                   session: accountingSession,
-                  records,
+                  records: accountingRecords,
                   cost: accountingCost,
                   rate,
                   model: rateModel,
