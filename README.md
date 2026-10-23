@@ -105,6 +105,8 @@ install_bundle  target: https://example.com/dsh-whale-pet.tgz
 
 `1.4.7` 起 Host 会把已结算的 tokens / periods 持久化到 `<DSH_PROFILE_DIR>/storages/pet-whale/periods.json`，DSH 重启后恢复；因此这一版升级仍需重启一次 DSH。重启前已经丢掉的历史时段无法追回，重启后新结算的时段会保留。
 
+`1.4.10` 起交互 `records` 也写入同一个文件，Host 启动时恢复，所以“今日用量/费用”在当天重启后不再清零（仍受 80 条记录窗口限制）。
+
 ## 依赖情况
 
 **没有任何运行时依赖,也没有 import。** 不需要 `node_modules`、不需要构建步骤:

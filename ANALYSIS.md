@@ -3,7 +3,7 @@
 | 项 | 值 |
 |---|---|
 | 被分析版本 | `dsh-whale-pet@1.0.0`（profile 中由 GitHub tarball 安装） |
-| 优化版本 | `1.4.9`（基线只在完整 token 投影后冻结，忙时不再丢失） |
+| 优化版本 | `1.4.10`（交互记录持久化，今日用量重启不丢） |
 | 对照插件 | `dsh-context@0.73.3` |
 | 运行环境 | DeepSeek Harness Web GUI（profile `desktop`） |
 | 改动范围 | Host `index.js`（待授权折叠）+ Browser `client.js`（上下文面板 / 紧急音 / 轮询） |
@@ -57,6 +57,7 @@
 | 18 | **DSH 重启后 Host 时段桶清零** | `sessionTotals` 只在 Host 进程内存里；DSH 重启后，历史闲时桶全部丢失，只剩浏览器完整 token 总量，所有历史 token 被归入忙时，闲时显示 0。 | 每次 episode settle 后把 session 的 tokens / periods / 标签写入 `<profile>/storages/pet-whale/periods.json`，Host apply 时恢复（v1.4.7）。重启前的第一次丢失无法追回，但之后的时段会保留。 |
 | 19 | **长会话闲时工作时忙时列跳动** | 长会话的历史缺口很大，Host 的 `periods` 每轮才追上；新到的闲时 token 在追上之前被当作“历史缺口”归忙时，下一轮再移到闲时，忙时列随之上下跳。 | 首次观察到时段时冻结该会话的**历史缺口 bucket**；历史部分固定归忙时，只有缺口的**增量**归当前时段。忙时列在闲时工作中保持不变（v1.4.8）。 |
 | 20 | **忙时数据被搬到闲时** | 页面刚加载时 Host 行只有一小段 `periods`，而浏览器完整 `tokenUsage` 还没合并；基线在此时被冻成 0，随后完整总量到达，巨大的历史缺口被当成“实时增量”归入闲时，忙时显示 0。 | 只有 `source === 'merged'`（完整 token 投影已到）才允许冻结基线；基线出现前，未分类缺口保守地留在忙时（v1.4.9）。 |
+| 21 | **重启后今日用量清零** | `Today` 由浏览器端 `records` 按本地日期汇总，而 `records` 只在 Host 内存里；DSH 重启后记录清空，今日 token / 费用变成 `—`。 | 把 `records` 一并写入 `periods.json`，Host apply 时恢复并恢复 `nextId`；今日统计随记录一起跨重启保留（v1.4.10）。仍受 80 条记录窗口限制。 |
 
 ---
 
@@ -225,6 +226,7 @@ Browser 半侧：
 - **实时轮询间隙（v1.4.6）**：新会话在浏览器投影更新、Host 时段尚未到达的瞬间会把差额短暂算进忙时；现在年龄 <1h 且覆盖 ≥25% 的差额归当前时段，轮询追上后不再出现“忙时闪一下又归零”。长会话的历史缺口仍归忙时。
 - **长会话历史峰值冻结（v1.4.8）**：首次看到长会话的时段时，把当时“总量 - 已记录 periods”的缺口 bucket 冻结为历史峰值；之后只把缺口的增量归当前时段。这样闲时请求流进来时，忙时列保持不动，闲时列单独增长。
 - **只冻结可信基线（v1.4.9）**：页面刚加载时 Host 行可能只有重启后的一小段 periods，浏览器完整 `tokenUsage` 未到；此时不能冻结基线，否则完整总量到达后历史缺口会被当作实时增量搬到闲时。现在只在 `source === 'merged'` 后冻结；基线出现前，缺口留在忙时。
+- **交互记录持久化（v1.4.10）**：`Today` 由记录汇总，所以 `records` 也写入 `periods.json`，Host 启动时恢复并更新 `nextId`；当天重启后今日 token / 费用不再清零（仍受 80 条记录窗口限制）。
 - **时段持久化（v1.4.7）**：Host 在每个 episode 结算后把 tokens / periods 写入 `<DSH_PROFILE_DIR>/storages/pet-whale/periods.json`，启动时恢复；DSH 重启后历史忙/闲桶不再清零。持久化只覆盖已结算 episode，进行中的回合按浏览器完整投影 + 当前时段处理。
 
 Host 的 `periods` 只覆盖本插件进程启动后的请求；要让当前长会话的历史也精确，仍依赖 dsh-context 的完整 `contextTimeline.cost`。Host v5 需要重启一次 DSH 才会开始记录新字段。

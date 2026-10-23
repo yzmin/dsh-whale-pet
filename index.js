@@ -474,6 +474,10 @@ export function apply(ctx) {
         version: PERIOD_STORE_VERSION,
         savedAt: Date.now(),
         sessions,
+        // Today is derived from the interaction records in the browser, so they
+        // must survive the Host restart too; otherwise "Today" clears while the
+        // session totals remain.
+        records: records.slice(0, MAX_RECORDS),
       }), 'utf8');
     } catch (error) {
       if (!persistWarned) {
@@ -496,6 +500,17 @@ export function apply(ctx) {
         });
         if (typeof row.label === 'string' && row.label !== '') labels.set(row.id, clip(row.label, 80));
       }
+    }
+    if (Array.isArray(stored?.records)) {
+      for (const row of stored.records) {
+        if (row === null || typeof row !== 'object' || !isSessionKey(row.sessionId)) continue;
+        if (typeof row.startedAt !== 'number' || typeof row.endedAt !== 'number') continue;
+        records.push(row);
+        if (typeof row.id === 'number' && Number.isFinite(row.id)) {
+          nextId = Math.max(nextId, Math.floor(row.id) + 1);
+        }
+      }
+      if (records.length > MAX_RECORDS) records.length = MAX_RECORDS;
     }
   } catch (error) {
     // ENOENT is the normal first run; any other read error is just a loss of
