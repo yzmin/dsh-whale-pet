@@ -3019,7 +3019,7 @@ window.__ModuleLoader__.load({
       const approvalTitle = approvalCount > 0 ? `需要授权 ${approvalCount} · Approval needed` : undefined;
       /** Context text reused by the pet's tooltip and accessible label. */
       const contextPct = context?.ratio === undefined ? undefined : `${(context.ratio * 100).toFixed(1)}%`;
-      const contextTitle = contextPct === undefined ? undefined : `上下文 ${contextPct} · Context ${contextPct}`;
+      const contextTitle = contextPct === undefined ? undefined : `上下文/Context ${contextPct}`;
 
       return h(
         React.Fragment,
