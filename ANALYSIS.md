@@ -3,7 +3,7 @@
 | 项 | 值 |
 |---|---|
 | 被分析版本 | `dsh-whale-pet@1.0.0`（profile 中由 GitHub tarball 安装） |
-| 优化版本 | `1.5.0`（内置费率按 models.dev DeepSeek V4 校准） |
+| 优化版本 | `1.5.1`（费率回退官方价目；1.5.0 的 models.dev 校准用了过期快照） |
 | 对照插件 | `dsh-context@0.73.3` |
 | 运行环境 | DeepSeek Harness Web GUI（profile `desktop`） |
 | 改动范围 | Host `index.js`（待授权折叠）+ Browser `client.js`（上下文面板 / 紧急音 / 轮询） |
@@ -58,7 +58,8 @@
 | 19 | **长会话闲时工作时忙时列跳动** | 长会话的历史缺口很大，Host 的 `periods` 每轮才追上；新到的闲时 token 在追上之前被当作“历史缺口”归忙时，下一轮再移到闲时，忙时列随之上下跳。 | 首次观察到时段时冻结该会话的**历史缺口 bucket**；历史部分固定归忙时，只有缺口的**增量**归当前时段。忙时列在闲时工作中保持不变（v1.4.8）。 |
 | 20 | **忙时数据被搬到闲时** | 页面刚加载时 Host 行只有一小段 `periods`，而浏览器完整 `tokenUsage` 还没合并；基线在此时被冻成 0，随后完整总量到达，巨大的历史缺口被当成“实时增量”归入闲时，忙时显示 0。 | 只有 `source === 'merged'`（完整 token 投影已到）才允许冻结基线；基线出现前，未分类缺口保守地留在忙时（v1.4.9）。 |
 | 21 | **重启后今日用量清零** | `Today` 由浏览器端 `records` 按本地日期汇总，而 `records` 只在 Host 内存里；DSH 重启后记录清空，今日 token / 费用变成 `—`。 | 把 `records` 一并写入 `periods.json`，Host apply 时恢复并恢复 `nextId`；今日统计随记录一起跨重启保留（v1.4.10）。仍受 80 条记录窗口限制。 |
-| 22 | **内置费率与 dsh-context 的 models.dev 估价差距大** | 旧表 `deepseek-flash` 为 miss ¥2/M、output ¥8/M，而 models.dev DeepSeek V4 Flash 为 $0.14/$0.28（cache read $0.0028）；同一会话宠物算 ¥1.00，dsh-context 约 $0.08/¥0.08，量级不一致。 | 按 models.dev DeepSeek V4 Flash/Pro 重新校准：CNY 用 1 CNY=0.15 USD，峰时 ×2；`deepseek-flash` 闲时 ¥0.0187/¥0.9333/¥1.8667，`v4-pro` 闲时 ¥0.0242/¥2.9/¥5.8（v1.5.0）。 |
+| 22 | **内置费率与 dsh-context 的 models.dev 估价差距大** | 旧表 `deepseek-flash` 为 miss ¥2/M、output ¥8/M，而 models.dev DeepSeek V4 Flash 为 $0.14/$0.28（cache read $0.0028）；同一会话宠物算 ¥1.00，dsh-context 约 $0.08/¥0.08，量级不一致。 | 按 models.dev DeepSeek V4 Flash/Pro 重新校准：CNY 用 1 CNY=0.15 USD，峰时 ×2；`deepseek-flash` 闲时 ¥0.0187/¥0.9333/¥1.8667，`v4-pro` 闲时 ¥0.0242/¥2.9/¥5.8（v1.5.0）。**v1.5.1 已回退，见 #23**。 |
+| 23 | **1.5.0 的"models.dev 校准"用了过期快照，导致全线低估** | 1.5.0 写入的 models.dev 值（input 0.14/0.435、output 0.28/0.87、cache read 0.0028/0.003625）是旧快照；2026-10-23 的 models.dev 已是 0.15/0.66、0.60/1.98、0.003/0.022（谷价 USD），官方输出价是 ¥8/¥27。实测当前会话 45 条高峰请求：网关逐笔实收 $0.127024，按官方 USD 表重算一分不差，而 1.5.0 只算 $0.082119（−35.4%）；今日卡片因费率 + 记录覆盖只到官方价的 39.7%。 | 1.5.1 回退为官方 CNY/USD 表（CNY flash 0.04/2/8、pro 0.3/9/27；USD flash 0.006/0.3/1.2、pro 0.044/1.32/3.96，谷价 = 峰价 ÷ 2），并修正面板费率来源文案；审计过程见 `BILLING-AUDIT.md`。 |
 
 ---
 
@@ -228,7 +229,7 @@ Browser 半侧：
 - **长会话历史峰值冻结（v1.4.8）**：首次看到长会话的时段时，把当时“总量 - 已记录 periods”的缺口 bucket 冻结为历史峰值；之后只把缺口的增量归当前时段。这样闲时请求流进来时，忙时列保持不动，闲时列单独增长。
 - **只冻结可信基线（v1.4.9）**：页面刚加载时 Host 行可能只有重启后的一小段 periods，浏览器完整 `tokenUsage` 未到；此时不能冻结基线，否则完整总量到达后历史缺口会被当作实时增量搬到闲时。现在只在 `source === 'merged'` 后冻结；基线出现前，缺口留在忙时。
 - **交互记录持久化（v1.4.10）**：`Today` 由记录汇总，所以 `records` 也写入 `periods.json`，Host 启动时恢复并更新 `nextId`；当天重启后今日 token / 费用不再清零（仍受 80 条记录窗口限制）。
-- **费率校准（v1.5.0）**：内置表改为 models.dev DeepSeek V4 Flash/Pro 的价目，CNY 按 `1 CNY = 0.15 USD` 换算，峰时 ×2；与 dsh-context 使用同一价格来源，金额差异只剩 provider 映射/实际折扣。
+- **费率修正（v1.5.1）**：1.5.0 的"models.dev 校准"用了过期快照（输出 0.28 vs 0.60），全线低估；1.5.1 回退到 DeepSeek 官方 CNY/USD 价目（谷价 = 峰价 ÷ 2），并用网关逐请求 spend 日志验证：官方 USD 表与实收完全一致。dsh-context 的 models.dev 谷价 ×2 本来就等于官方 USD 表，两个口径不再冲突。
 - **时段持久化（v1.4.7）**：Host 在每个 episode 结算后把 tokens / periods 写入 `<DSH_PROFILE_DIR>/storages/pet-whale/periods.json`，启动时恢复；DSH 重启后历史忙/闲桶不再清零。持久化只覆盖已结算 episode，进行中的回合按浏览器完整投影 + 当前时段处理。
 
 Host 的 `periods` 只覆盖本插件进程启动后的请求；要让当前长会话的历史也精确，仍依赖 dsh-context 的完整 `contextTimeline.cost`。Host v5 需要重启一次 DSH 才会开始记录新字段。
