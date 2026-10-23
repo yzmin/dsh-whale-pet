@@ -1260,7 +1260,11 @@ window.__ModuleLoader__.load({
 /* A short burst up and outward, then a quick fade as it falls back. */
 @keyframes ${PREFIX}-spout{0%{opacity:0;transform:scaleY(.15) translateY(0)}12%{opacity:1}45%{opacity:1;transform:scaleY(1) translateY(0)}100%{opacity:0;transform:scaleY(1.12) translateY(-1.4px)}}
 @keyframes ${PREFIX}-slide{from{opacity:0;transform:translateY(10px) scale(.985)}to{opacity:1;transform:none}}
-.${PREFIX}-panel{width:390px;max-width:min(92vw,390px);max-height:min(90vh,860px);display:flex;flex-direction:column;min-height:0;overflow:hidden;border-radius:14px;border:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.1));background:var(--dsw-alias-bg-overlay,#fff);box-shadow:0 18px 48px rgba(16,24,48,.24);animation:${PREFIX}-slide .22s ease-out}
+/* The panel is bottom-anchored above the pet (20 px inset + 88 px whale + 10 px
+   gap = 118 px). A 90vh cap ignores that offset, so on short windows the panel
+   overflowed the viewport top and clipped its pinned header; size against the
+   space that is actually above the anchor instead, and keep a 14 px margin. */
+.${PREFIX}-panel{width:390px;max-width:min(92vw,390px);max-height:min(calc(100vh - 132px),860px);display:flex;flex-direction:column;min-height:0;overflow:hidden;border-radius:14px;border:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.1));background:var(--dsw-alias-bg-overlay,#fff);box-shadow:0 18px 48px rgba(16,24,48,.24);animation:${PREFIX}-slide .22s ease-out}
 .${PREFIX}-head{display:flex;align-items:center;gap:9px;padding:11px 13px;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.1));background:var(--dsw-alias-bg-layer-2,rgba(0,0,0,.02));flex:none}
 /* The scrolling region. Everything between the pinned header and footer lives
    here and scrolls as one surface, which is what keeps the footer inside the
