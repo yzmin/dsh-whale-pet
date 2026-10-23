@@ -75,6 +75,12 @@ window.__ModuleLoader__.load({
      * `cacheWriteTokens` deliberately has no rate of its own — DeepSeek reports
      * it but bills it as a cache miss, i.e. at the full input rate.
      */
+    /**
+     * Calibrated against the DeepSeek V4 Flash/Pro models.dev rates in USD:
+     * input 0.14/0.435, output 0.28/0.87, cache read 0.0028/0.003625 per 1M.
+     * CNY uses 1 CNY = 0.15 USD (the same conversion as dsh-context); DeepSeek
+     * peak is 2x the off-peak/list rate.
+     */
     const RATE_TABLES = {
       CNY: {
         symbol: '¥',
@@ -82,13 +88,13 @@ window.__ModuleLoader__.load({
         models: {
           'deepseek-flash': {
             label: 'deepseek-flash',
-            peak: { hit: 0.04, miss: 2, output: 8 },
-            offPeak: { hit: 0.02, miss: 1, output: 4 },
+            peak: { hit: 0.0373, miss: 1.8667, output: 3.7333 },
+            offPeak: { hit: 0.0187, miss: 0.9333, output: 1.8667 },
           },
           'deepseek-v4-pro': {
             label: 'deepseek-v4-pro',
-            peak: { hit: 0.3, miss: 9, output: 27 },
-            offPeak: { hit: 0.15, miss: 4.5, output: 13.5 },
+            peak: { hit: 0.0483, miss: 5.8, output: 11.6 },
+            offPeak: { hit: 0.0242, miss: 2.9, output: 5.8 },
           },
         },
       },
@@ -98,13 +104,13 @@ window.__ModuleLoader__.load({
         models: {
           'deepseek-flash': {
             label: 'deepseek-flash',
-            peak: { hit: 0.006, miss: 0.3, output: 1.2 },
-            offPeak: { hit: 0.003, miss: 0.15, output: 0.6 },
+            peak: { hit: 0.0056, miss: 0.28, output: 0.56 },
+            offPeak: { hit: 0.0028, miss: 0.14, output: 0.28 },
           },
           'deepseek-v4-pro': {
             label: 'deepseek-v4-pro',
-            peak: { hit: 0.044, miss: 1.32, output: 3.96 },
-            offPeak: { hit: 0.022, miss: 0.66, output: 1.98 },
+            peak: { hit: 0.00725, miss: 0.87, output: 1.74 },
+            offPeak: { hit: 0.003625, miss: 0.435, output: 0.87 },
           },
         },
       },
@@ -2007,9 +2013,11 @@ window.__ModuleLoader__.load({
           h('br'),
           `闲时 命中 ${symbol}${offRate.hit}/M · 未命中 ${symbol}${offRate.miss}/M · 输出 ${symbol}${offRate.output}/M（每 1M token）`,
           h('br'),
+          '费率来源：models.dev DeepSeek V4 Flash / Pro；按 1 CNY = 0.15 USD 换算，峰时 ×2。',
+          h('br'),
           '高峰时段为北京时间周一至周五 09–12、14–18 点（即 UTC 01–04、06–10）；中国法定节假日按低谷计费，此处未扣除，因此节假日可能高估。',
           h('br'),
-          '费用为本地费率估算；dsh-context 的 Context Stats 使用 models.dev 价目，估算结果可能与此处不同。',
+          'dsh-context 的 Context Stats 同样以 models.dev 为参考；两边仍不同时，通常来自自定义 provider 的模型映射或实际账单折扣。',
           session.source === 'client'
             ? h('span', null, h('br'), '数据来源：浏览器会话投影（主机端尚未上报，因此没有分次明细与请求次数）。')
             : session.source === 'merged'
