@@ -41,7 +41,7 @@ const PERIOD_STORE = join(
   'pet-whale',
   'periods.json',
 );
-const PERIOD_STORE_VERSION = 1;
+const PERIOD_STORE_VERSION = 2;
 const MAX_STORED_SESSIONS = 400;
 
 /**
@@ -164,16 +164,127 @@ function clonePeriods(periods) {
 }
 
 /**
+ * Per-model peak/off buckets, keyed by the provider's model id.
+ *
+ * The panel defaulted to one selected model and priced every token with it;
+ * a session that mixed `deepseek-flash` and `deepseek-v4-pro` was therefore
+ * wrong by roughly 3x. The Host now records the actual model of each settled
+ * request so the browser can price each bucket with its own table.
+ */
+function emptyModels() {
+  return {};
+}
+
+/** Reject keys that would poison `Object.entries` or a JSON round-trip. */
+function safeModelName(value) {
+  if (typeof value !== 'string' || value === '') return 'unknown';
+  if (value === '__proto__' || value === 'constructor' || value === 'prototype') return 'unknown';
+  return value.length > 120 ? `${value.slice(0, 119)}…` : value;
+}
+
+/** Deep-copy a model map. */
+function cloneModels(models) {
+  const copy = {};
+  if (models === null || typeof models !== 'object') return copy;
+  for (const [model, periods] of Object.entries(models)) {
+    if (periods === null || typeof periods !== 'object') continue;
+    copy[safeModelName(model)] = clonePeriods(periods);
+  }
+  return copy;
+}
+
+/** Validate/copy a model map read from the persisted store. */
+function storedModels(value) {
+  const models = {};
+  if (value === null || typeof value !== 'object') return models;
+  for (const [model, periods] of Object.entries(value)) {
+    models[safeModelName(model)] = storedPeriods(periods);
+  }
+  return models;
+}
+
+/** One Beijing calendar day of billable usage, with its own model map. */
+function emptyDay(date) {
+  return { date, tokens: emptyTokens(), periods: emptyPeriods(), models: emptyModels() };
+}
+
+/** Deep-copy one day bucket. */
+function cloneDay(day) {
+  return {
+    date: typeof day?.date === 'string' ? day.date : '',
+    tokens: cloneTokens(day?.tokens ?? emptyTokens()),
+    periods: clonePeriods(day?.periods ?? emptyPeriods()),
+    models: cloneModels(day?.models ?? emptyModels()),
+  };
+}
+
+/** Deep-copy a date-keyed day map. */
+function cloneDays(days) {
+  const copy = {};
+  if (days === null || typeof days !== 'object') return copy;
+  for (const [date, day] of Object.entries(days)) {
+    if (!/^\d{4}-\d{2}-\d{2}$/u.test(date) || day === null || typeof day !== 'object') continue;
+    copy[date] = cloneDay(day);
+  }
+  return copy;
+}
+
+/** Validate/copy a day map read from the persisted store. */
+function storedDays(value) {
+  const days = {};
+  if (value === null || typeof value !== 'object') return days;
+  for (const [date, day] of Object.entries(value)) {
+    if (!/^\d{4}-\d{2}-\d{2}$/u.test(date) || day === null || typeof day !== 'object') continue;
+    days[date] = {
+      date,
+      tokens: storedTokens(day.tokens),
+      periods: storedPeriods(day.periods),
+      models: storedModels(day.models),
+    };
+  }
+  return days;
+}
+
+/**
+ * Chinese statutory holidays, as Beijing calendar dates.
+ *
+ * Source: 国办发明电〔2025〕7号, published 2025-11-04
+ * (https://www.gov.cn/zhengce/content/202511/content_7047090.htm).
+ * Weekends are already off-peak, so only the weekday dates matter here.
+ * Update this list when the State Council publishes the next year's
+ * arrangement; an unknown year falls back to "holiday is peak", which is the
+ * same conservative behaviour as before this list existed.
+ */
+const CN_HOLIDAYS_2026 = [
+  '2026-01-01', '2026-01-02',
+  '2026-02-16', '2026-02-17', '2026-02-18', '2026-02-19', '2026-02-20', '2026-02-23',
+  '2026-04-06',
+  '2026-05-01', '2026-05-04', '2026-05-05',
+  '2026-06-19',
+  '2026-09-25',
+  '2026-10-01', '2026-10-02', '2026-10-05', '2026-10-06', '2026-10-07',
+];
+/** Union of every year modelled so far. */
+const CN_HOLIDAYS = new Set(CN_HOLIDAYS_2026);
+
+/** Beijing calendar date (`YYYY-MM-DD`) for one instant. */
+function beijingDayKey(time) {
+  if (typeof time !== 'number' || !Number.isFinite(time)) return '';
+  return new Date(time + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+/**
  * Whether an event time falls in DeepSeek's peak billing window.
  *
- * Beijing time, Monday–Friday, 09:00–12:00 and 14:00–18:00. Weekends are
- * off-peak; statutory holidays are not modelled here, so a holiday request is
- * classified as peak and the estimate can be high (the UI says so).
+ * Beijing time, Monday–Friday, 09:00–12:00 and 14:00–18:00, excluding Chinese
+ * statutory holidays. The holiday list is bundled above; requests outside a
+ * modelled year keep the old conservative behaviour and count as peak.
  *
  * @param time - epoch milliseconds from the session event.
  */
 function isPeakTime(time) {
   if (typeof time !== 'number' || !Number.isFinite(time)) return false;
+  if (CN_HOLIDAYS.has(beijingDayKey(time))) return false;
   const beijing = new Date(time + 8 * 60 * 60 * 1000);
   const day = beijing.getUTCDay();
   const hour = beijing.getUTCHours();
@@ -433,6 +544,8 @@ export function apply(ctx) {
         periodsFrom: undefined,
         tokens: emptyTokens(),
         periods: emptyPeriods(),
+        models: emptyModels(),
+        days: {},
       };
       sessionTotals.set(sessionId, entry);
     }
@@ -468,15 +581,17 @@ export function apply(ctx) {
           periodsFrom: entry.periodsFrom,
           tokens: cloneTokens(entry.tokens),
           periods: clonePeriods(entry.periods),
+          models: cloneModels(entry.models),
+          days: cloneDays(entry.days),
         }));
       mkdirSync(dirname(PERIOD_STORE), { recursive: true });
       writeFileSync(PERIOD_STORE, JSON.stringify({
         version: PERIOD_STORE_VERSION,
         savedAt: Date.now(),
         sessions,
-        // Today is derived from the interaction records in the browser, so they
-        // must survive the Host restart too; otherwise "Today" clears while the
-        // session totals remain.
+        // Today is derived from the per-session day ledgers above, so they must
+        // survive a Host restart too; the interaction records are kept for the
+        // per-episode list and as a fallback for older Host versions.
         records: records.slice(0, MAX_RECORDS),
       }), 'utf8');
     } catch (error) {
@@ -488,7 +603,7 @@ export function apply(ctx) {
   };
   try {
     const stored = JSON.parse(readFileSync(PERIOD_STORE, 'utf8'));
-    if (stored?.version === PERIOD_STORE_VERSION && Array.isArray(stored.sessions)) {
+    if ((stored?.version === 1 || stored?.version === PERIOD_STORE_VERSION) && Array.isArray(stored.sessions)) {
       for (const row of stored.sessions) {
         if (!isSessionKey(row?.id)) continue;
         sessionTotals.set(row.id, {
@@ -497,6 +612,8 @@ export function apply(ctx) {
           periodsFrom: epochMs(row.periodsFrom),
           tokens: storedTokens(row.tokens),
           periods: storedPeriods(row.periods),
+          models: storedModels(row.models),
+          days: storedDays(row.days),
         });
         if (typeof row.label === 'string' && row.label !== '') labels.set(row.id, clip(row.label, 80));
       }
@@ -530,6 +647,85 @@ export function apply(ctx) {
     mergeTokens(target.peak, source.peak);
     mergeTokens(target.off, source.off);
   };
+  /** Merge a model map into another. */
+  const mergeModels = (target, source) => {
+    for (const [model, periods] of Object.entries(source ?? {})) {
+      const key = safeModelName(model);
+      if (target[key] === undefined) target[key] = emptyPeriods();
+      mergePeriods(target[key], periods);
+    }
+  };
+  /** Merge one day bucket into another; the caller guarantees the same date. */
+  const mergeDay = (target, source) => {
+    mergeTokens(target.tokens, source.tokens);
+    mergePeriods(target.periods, source.periods);
+    mergeModels(target.models, source.models);
+  };
+  /** Merge a date-keyed day map into another. */
+  const mergeDays = (target, source) => {
+    for (const [date, day] of Object.entries(source ?? {})) {
+      if (target[date] === undefined) target[date] = emptyDay(date);
+      mergeDay(target[date], day);
+    }
+  };
+  /** Record one usage sample against its actual model and billing period. */
+  const addModelUsage = (models, model, usage, period) => {
+    const key = safeModelName(model);
+    if (models[key] === undefined) models[key] = emptyPeriods();
+    addUsage(models[key][period], usage);
+  };
+  /** Record one usage sample into a date-keyed map, resetting on a new day. */
+  const addDayUsage = (days, time, usage, period, model) => {
+    const date = beijingDayKey(time);
+    if (date === '') return;
+    if (days[date] === undefined) days[date] = emptyDay(date);
+    const day = days[date];
+    addUsage(day.tokens, usage);
+    addUsage(day.periods[period], usage);
+    addModelUsage(day.models, model, usage, period);
+    // Keep a week of days: enough for "today" across a restart, bounded memory.
+    const keys = Object.keys(days).sort();
+    while (keys.length > 8) delete days[keys.shift()];
+  };
+
+  /**
+   * Seed today's day ledger from the persisted records.
+   *
+   * A store written before v6 has no `days`; without this backfill, the first
+   * v6 snapshot would report Today=0 after a restart, then jump to only the
+   * post-restart usage as soon as the next request lands. Records are exactly
+   * the episodes that were lost, so they can rebuild the day.
+   */
+  const seedTodayFromRecords = () => {
+    const today = beijingDayKey(Date.now());
+    for (const row of records) {
+      if (row === null || typeof row !== 'object' || !isSessionKey(row.sessionId)) continue;
+      const endedAt = typeof row.endedAt === 'number' ? row.endedAt : row.startedAt;
+      if (typeof endedAt !== 'number' || beijingDayKey(endedAt) !== today) continue;
+      const entry = sessionTotals.get(row.sessionId);
+      if (entry === undefined) continue;
+      if (entry.days === undefined) entry.days = {};
+      // v2 stores already carry the day; seeding again would double-count it.
+      if (entry.days[today] !== undefined) continue;
+      entry.days[today] = emptyDay(today);
+      const day = entry.days[today];
+      const tokens = storedTokens(row.tokens);
+      mergeTokens(day.tokens, tokens);
+      let periods = storedPeriods(row.periods);
+      if (tokensTotal(periods.peak) + tokensTotal(periods.off) === 0) {
+        // Legacy record without a split: classify the whole episode by its end.
+        periods = emptyPeriods();
+        addUsage(periods[periodKey(endedAt)], tokens);
+      }
+      mergePeriods(day.periods, periods);
+      mergeModels(day.models, storedModels(row.models));
+    }
+  };
+  try {
+    seedTodayFromRecords();
+  } catch (error) {
+    warn(ctx, `pet-whale: could not seed today from records — ${error instanceof Error ? error.message : String(error)}`);
+  }
 
   const feed_ = (kind, text, sessionId) => {
     feed.unshift({ kind, text: clip(text, TEXT_LIMIT), sessionId, time: Date.now() });
@@ -591,6 +787,8 @@ export function apply(ctx) {
         error: undefined,
         tokens: emptyTokens(),
         periods: emptyPeriods(),
+        models: emptyModels(),
+        days: {},
       };
       open.set(sessionId, episode);
     }
@@ -615,6 +813,10 @@ export function apply(ctx) {
     mergeTokens(totals.tokens, episode.tokens);
     if (totals.periods === undefined) totals.periods = emptyPeriods();
     mergePeriods(totals.periods, episode.periods ?? emptyPeriods());
+    if (totals.models === undefined) totals.models = emptyModels();
+    mergeModels(totals.models, episode.models ?? emptyModels());
+    if (totals.days === undefined) totals.days = {};
+    mergeDays(totals.days, episode.days ?? {});
     pushRecord({
       id: nextId,
       sessionId,
@@ -629,6 +831,7 @@ export function apply(ctx) {
       steps: episode.steps,
       tokens: cloneTokens(episode.tokens),
       periods: clonePeriods(episode.periods),
+      models: cloneModels(episode.models),
       ...episode.error === undefined ? {} : { error: episode.error },
     });
     nextId += 1;
@@ -685,6 +888,13 @@ export function apply(ctx) {
           if (episode.periods === undefined) episode.periods = emptyPeriods();
           const period = episode.pendingPeriod ?? periodKey(now);
           addUsage(episode.periods[period], data.usage);
+          // The actual model travels with the sample: a session may mix flash
+          // and pro, and pricing every bucket with one selected model is wrong.
+          const model = message?.source?.model;
+          addModelUsage(episode.models, model, data.usage, period);
+          // Keep a per-Beijing-day ledger so "Today" covers the running session
+          // and survives a Host restart, instead of only the 80 saved records.
+          addDayUsage(episode.days, now, data.usage, period, model);
           episode.pendingPeriod = undefined;
           const totals = totalsOf(sessionId);
           if (totals.periodsFrom === undefined) totals.periodsFrom = now;
@@ -845,6 +1055,12 @@ export function apply(ctx) {
         }
         const periods = entry.periods === undefined ? emptyPeriods() : clonePeriods(entry.periods);
         if (live !== undefined && live.periods !== undefined) mergePeriods(periods, live.periods);
+        const models = entry.models === undefined ? emptyModels() : cloneModels(entry.models);
+        if (live !== undefined && live.models !== undefined) mergeModels(models, live.models);
+        const days = entry.days === undefined ? {} : cloneDays(entry.days);
+        if (live !== undefined && live.days !== undefined) mergeDays(days, live.days);
+        const todayKey = beijingDayKey(now);
+        const today = days[todayKey] === undefined ? emptyDay(todayKey) : cloneDay(days[todayKey]);
         const startedAt = entry.startedAt;
         const lastEventAt = entry.lastEventAt ?? live?.startedAt;
         // A clamp as well as a normalization: even a correctly-built timestamp
@@ -862,6 +1078,8 @@ export function apply(ctx) {
           running: running.get(sessionId) === true,
           tokens,
           periods,
+          models,
+          today,
           periodsFrom: entry.periodsFrom,
           totalTokens: tokensTotal(tokens),
         });
@@ -884,7 +1102,7 @@ export function apply(ctx) {
     approvalRows.sort((left, right) => right.askedAt - left.askedAt);
 
     return {
-      version: 5,
+      version: 6,
       now,
       busy: active.length > 0,
       active,

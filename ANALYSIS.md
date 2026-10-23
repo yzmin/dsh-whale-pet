@@ -3,7 +3,7 @@
 | 项 | 值 |
 |---|---|
 | 被分析版本 | `dsh-whale-pet@1.0.0`（profile 中由 GitHub tarball 安装） |
-| 优化版本 | `1.5.1`（费率回退官方价目；1.5.0 的 models.dev 校准用了过期快照） |
+| 优化版本 | `1.6.0`（1.5.1 费率回退官方价目；1.6.0 补节假日、按实际模型计价、Host 按日账本） |
 | 对照插件 | `dsh-context@0.73.3` |
 | 运行环境 | DeepSeek Harness Web GUI（profile `desktop`） |
 | 改动范围 | Host `index.js`（待授权折叠）+ Browser `client.js`（上下文面板 / 紧急音 / 轮询） |
@@ -212,10 +212,10 @@ Browser 半侧：
 |---|---|
 | Host | 每个 `step/start` 按北京时间判断：周一至周五 09–12、14–18 为 `peak`，其余为 `off`；该步的 usage 落到对应桶（没有 step 时用 `assistant/message` 时间兜底）；episode/session 都累计 `periods.peak` / `periods.off` |
 | Record | 每个交互记录也带 `periods`，所以“每次交互”的费用可以按它自己的时段算，而不是按渲染时时段 |
-| Snapshot | `version: 5`；每个 session 行增加 `periods` 和 `periodsFrom` |
+| Snapshot | `version: 6`；每个 session 行增加 `periods`、`periodsFrom`、`models`、`today` |
 | Client | 优先用 Host `periods`；Host 启动前的记录用 `endedAt` 时间回退；再没有时段就归入忙时；不存在 `partial` / “未分时段”状态 |
 
-峰/谷窗口按北京时间工作日 09–12、14–18；周末按低谷。中国法定节假日没有单独建模，节假日请求会被当作高峰，卡片已注明可能高估。
+峰/谷窗口按北京时间工作日 09–12、14–18；周末按低谷。`1.6.0` 起内置 2026 年法定节假日（国办发明电〔2025〕7号），节假日按低谷；2027 年及以后需要更新 `CN_HOLIDAYS_2026`，未建模的年份仍按高峰保守估算。
 
 **旧记录与非 DeepSeek provider（v1.4.1）：**
 
@@ -229,10 +229,14 @@ Browser 半侧：
 - **长会话历史峰值冻结（v1.4.8）**：首次看到长会话的时段时，把当时“总量 - 已记录 periods”的缺口 bucket 冻结为历史峰值；之后只把缺口的增量归当前时段。这样闲时请求流进来时，忙时列保持不动，闲时列单独增长。
 - **只冻结可信基线（v1.4.9）**：页面刚加载时 Host 行可能只有重启后的一小段 periods，浏览器完整 `tokenUsage` 未到；此时不能冻结基线，否则完整总量到达后历史缺口会被当作实时增量搬到闲时。现在只在 `source === 'merged'` 后冻结；基线出现前，缺口留在忙时。
 - **交互记录持久化（v1.4.10）**：`Today` 由记录汇总，所以 `records` 也写入 `periods.json`，Host 启动时恢复并更新 `nextId`；当天重启后今日 token / 费用不再清零（仍受 80 条记录窗口限制）。
-- **费率修正（v1.5.1）**：1.5.0 的"models.dev 校准"用了过期快照（输出 0.28 vs 0.60），全线低估；1.5.1 回退到 DeepSeek 官方 CNY/USD 价目（谷价 = 峰价 ÷ 2），并用网关逐请求 spend 日志验证：官方 USD 表与实收完全一致。dsh-context 的 models.dev 谷价 ×2 本来就等于官方 USD 表，两个口径不再冲突。
+- **费率修正（v1.5.1）**：1.5.0 的"models.dev 校准"用了过期快照（输出 0.28 vs 0.60），全线低估；1.5.1 回退到 DeepSeek 官方 CNY/USD 价目（谷价 = 峰价 ÷ 2），并用网关峰时逐请求 spend 日志验证：官方 USD 表与实收完全一致。dsh-context 的 models.dev 谷价 ×2 本来就等于官方 USD 表，两个口径不再冲突。
 - **时段持久化（v1.4.7）**：Host 在每个 episode 结算后把 tokens / periods 写入 `<DSH_PROFILE_DIR>/storages/pet-whale/periods.json`，启动时恢复；DSH 重启后历史忙/闲桶不再清零。持久化只覆盖已结算 episode，进行中的回合按浏览器完整投影 + 当前时段处理。
+- **节假日表（v1.6.0）**：内置 2026 年国务院法定节假日（北京日期），`isPeakTime` 先查节假日表，命中即低谷；周末本就低谷。Host 与浏览器两端共用同一份日期，避免一边按峰、一边按谷。2027 年放假安排发布后需要补表。
+- **按实际模型计价（v1.6.0）**：Host 快照 v6 在 session / record 上增加 `models`（按 model id 存 peak/off 桶），每个 `assistant/message` 从 `message.source.model` 取真实模型。客户端 `priceModelLedger` 逐模型套费率；Host 升级前只有 `periods` 没有 `models` 的部分，以及浏览器投影多出来的历史 token，都归到当前下拉框选中的 fallback 模型（忙时优先），所以总数不会丢。混用 flash + pro 时不再把 pro 按 flash 计价。
+- **Today 按日账本（v1.6.0）**：Host 会话行增加 `today`（`date` + `tokens` + `periods` + `models`），每次 usage 按北京日期落入会话的 `days` 账本，持久化保留最近 8 天。面板优先汇总所有会话的 `today`，因此覆盖正在运行的回合和 Host 重启前的当天数据；老 Host 没有 `today` 时回退到 80 条记录。记录窗口不再是 Today 的上限。
+- **Host 快照 v6 / store v2**：新增 `models` / `today` 字段；`periods.json` 版本从 1 升到 2，读取时兼容 v1（缺失字段按空处理），不需要手工迁移。升级后需重启一次 DSH 才能让 Host 半侧生效。
 
-Host 的 `periods` 只覆盖本插件进程启动后的请求；要让当前长会话的历史也精确，仍依赖 dsh-context 的完整 `contextTimeline.cost`。Host v5 需要重启一次 DSH 才会开始记录新字段。
+Host 的 `periods` / `models` 只覆盖本插件进程启动后的请求；要让当前长会话的历史也精确，仍依赖 dsh-context 的完整 `contextTimeline.cost`。Host v6 需要重启一次 DSH 才会开始记录 `models` / `today`。`periods` 升级前的历史没有模型归属，客户端归到 fallback 模型（忙时优先）。
 
 ---
 
@@ -289,6 +293,10 @@ Host 的 `periods` 只覆盖本插件进程启动后的请求；要让当前长�
 | `WhalePet` 初始渲染断言 | title 含 `4.2%`；按钮不再渲染任何外圈节点 |
 | `Panel` 渲染断言 | Context 卡片出现在 Usage 卡片之前，内容完整 |
 | Host 审批折叠桩测试 | `approval/asked` → 1 条；重复 ask 不膨胀；`approval/decided` → 0；`session/disposed` 清空；快照 `version: 4` |
+| 计费 v1.5.1 回归 | 真实 `client.js` 37 通过 / 0 失败；官方费率、峰谷边界、金额格式 |
+| 计费 v1.6.0 客户端 | 26 通过 / 0 失败：2026 节假日、flash+pro 分别计价、未知模型回退、v5 无 `models` 兼容、无时段会话、历史缺口 |
+| Usage 卡片渲染 v1.6.0 | 12 通过 / 0 失败：混模 ¥0.00650、Today 按日账本、部分模型补齐、按实际模型文案、v5 回退 ¥0.00250 + 记录说明 |
+| Host v1.6.0 集成 | 19 通过 / 0 失败：快照 v6、节假日落 off 桶、`models` / `today`、记录携带模型、store v2、重启恢复、v1 store 兼容 |
 | 授权面板渲染断言 | `需要授权`、工具名 `bash`、原因、会话标签均出现 |
 | `install_bundle` | `application: applied`，安装时 `1.1.0`；当前 link 版本 `1.2.0` |
 | `Config.listConfigs name=dsh-whale-pet` | 存在 `include:pet-whale` |
@@ -302,7 +310,9 @@ Host 的 `periods` 只覆盖本插件进程启动后的请求；要让当前长�
 - **没有读取到实时的 projection 值**：验证用的是按已确认 schema 构造的桩数据；真实 dsh-context 投影是否存在，需要刷新后看面板 Context 卡片是否出现。
 - **“上下文洞察”跳转按钮没有真实点击验证**：`layout.selectPanel('dsh-context')` 的 key 已通过 `Slots` 确认，但点击后的页面切换未在浏览器里执行。
 - **权限紧急音没有真实试听**：音符、音色与调度走的是既有 `renderChime` 路径，`audio.urgent()` 已接入；实际音量与“紧急感”需要重启后在浏览器里确认。
-- **Host 审批折叠尚未在真实进程重启后验证**：桩测试覆盖了 asked/decided/重复/disposed，但当前线上 `/pet-whale/state` 仍是旧进程的 `version: 3`；重启后才会变成 `4`。
+- **Host v6 尚未在真实进程重启后验证**：桩测试覆盖了 models / today / 持久化迁移，但当前线上 `/pet-whale/state` 仍是旧进程的 `version: 5`；重启后才会变成 `6`。
+- **2027 年节假日未建模**：`CN_HOLIDAYS_2026` 只覆盖 2026 年；2027 年放假安排发布后需要补表，否则节假日仍按高峰保守估算。
+- **网关结算**：按官方口径处理，插件不另设网关价。网关 `spend` 字段是内部 list 记账（谷时也按峰价记），只用于核对 token，不作为谷时金额基准；实际结算按 DeepSeek 官方峰谷/节假日规则。
 
 ---
 

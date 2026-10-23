@@ -131,16 +131,44 @@ window.__ModuleLoader__.load({
     const PEAK_WINDOWS = [[1, 4], [6, 10]];
 
     /**
+     * Chinese statutory holidays, as Beijing calendar dates.
+     *
+     * Source: 国办发明电〔2025〕7号 (2025-11-04), the 2026 arrangement. Weekends
+     * are already off-peak, so only weekday dates are listed. Update this list
+     * when the next year is published; an unmodelled year keeps the old
+     * conservative "holiday = peak" behaviour.
+     */
+    const CN_HOLIDAYS_2026 = new Set([
+      '2026-01-01', '2026-01-02',
+      '2026-02-16', '2026-02-17', '2026-02-18', '2026-02-19', '2026-02-20', '2026-02-23',
+      '2026-04-06',
+      '2026-05-01', '2026-05-04', '2026-05-05',
+      '2026-06-19',
+      '2026-09-25',
+      '2026-10-01', '2026-10-02', '2026-10-05', '2026-10-06', '2026-10-07',
+    ]);
+    const CN_HOLIDAYS = new Set(CN_HOLIDAYS_2026);
+
+    /** Beijing calendar date (`YYYY-MM-DD`) for one instant. */
+    function beijingDayKey(time) {
+      if (typeof time !== 'number' || !Number.isFinite(time)) return '';
+      return new Date(time + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    }
+
+    /**
      * Whether a moment falls in a peak-pricing window.
      *
      * @param date - the instant to test.
      * @returns true when peak rates apply.
      */
     function isPeak(date) {
-      const day = date.getUTCDay();
-      if (day === 0 || day === 6) return false;
-      const hour = date.getUTCHours();
-      return PEAK_WINDOWS.some(([start, end]) => hour >= start && hour < end);
+      // Do not use `instanceof Date`: the client runs in a VM sandbox in tests,
+      // where an outer-realm Date is a different constructor and would read as
+      // false. A method check works across realms.
+      if (date === null || typeof date !== 'object' || typeof date.getTime !== 'function') return false;
+      const time = date.getTime();
+      if (!Number.isFinite(time)) return false;
+      return isPeakTime(time);
     }
 
     /**
@@ -518,6 +546,176 @@ window.__ModuleLoader__.load({
       return { cacheHitCost, inputCost, outputCost, total: cacheHitCost + inputCost + outputCost, split: true };
     }
 
+    /** Price a period pair, or fall back to the flat token total when empty. */
+    function priceOrFlat(periods, tokens, table, fallbackModel, fallbackRate) {
+      const priced = pricePeriods(periods, table, fallbackModel);
+      if (priced !== undefined && (priced.total > 0 || tokensTotal(tokens) === 0)) return priced;
+      return priceTokens(tokens, fallbackRate);
+    }
+
+    /** Resolve one model's peak/off rates, falling back to the selected model. */
+    function ratesFor(table, modelId, fallbackModel) {
+      const models = table !== null && typeof table === 'object' && table.models !== null && typeof table.models === 'object' ? table.models : {};
+      return models[modelId] ?? models[fallbackModel] ?? Object.values(models)[0];
+    }
+
+    /** Price one peak/off pair with explicit rates. */
+    function pricePeriodsWithRates(periods, rates) {
+      if (periods === null || typeof periods !== 'object' || rates === undefined) return undefined;
+      let cacheHitCost = 0;
+      let inputCost = 0;
+      let outputCost = 0;
+      for (const period of ['peak', 'off']) {
+        const bucket = periods[period];
+        const rate = period === 'peak' ? rates.peak : rates.offPeak;
+        if (bucket === null || typeof bucket !== 'object' || rate === undefined) continue;
+        const priced = priceTokens(bucket, rate);
+        cacheHitCost += priced.cacheHitCost;
+        inputCost += priced.inputCost;
+        outputCost += priced.outputCost;
+      }
+      return { cacheHitCost, inputCost, outputCost, total: cacheHitCost + inputCost + outputCost, split: true };
+    }
+
+    /** Guard model ids used as object keys; Host sanitizes too. */
+    function safeModelKey(model) {
+      const key = String(model);
+      return key === '__proto__' || key === 'constructor' || key === 'prototype' ? 'unknown' : key;
+    }
+
+    /** Deep-copy a model map into `{ model: { peak, off } }` buckets. */
+    function modelPeriodsFrom(source) {
+      const out = {};
+      if (source === null || typeof source !== 'object') return out;
+      for (const [model, periods] of Object.entries(source)) {
+        if (periods === null || typeof periods !== 'object') continue;
+        const key = safeModelKey(model);
+        out[key] = { peak: zeroTokens(), off: zeroTokens() };
+        addBuckets(out[key].peak, periods.peak);
+        addBuckets(out[key].off, periods.off);
+      }
+      return out;
+    }
+
+    /** Merge one model map into another. */
+    function mergeModelPeriods(target, source) {
+      for (const [model, periods] of Object.entries(source ?? {})) {
+        if (periods === null || typeof periods !== 'object') continue;
+        const key = safeModelKey(model);
+        if (target[key] === undefined) target[key] = { peak: zeroTokens(), off: zeroTokens() };
+        addBuckets(target[key].peak, periods.peak);
+        addBuckets(target[key].off, periods.off);
+      }
+      return target;
+    }
+
+    /**
+     * Price every model in a per-model ledger with its own rate table.
+     *
+     * The old path priced all tokens with whichever model the select showed,
+     * so a flash+pro session was wrong by ~3x on the pro share. This returns
+     * both the summed components and the per-model rows the UI can explain.
+     */
+    function priceModelLedger(modelPeriods, table, fallbackModel) {
+      const ledger = {
+        total: 0,
+        cacheHitCost: 0,
+        inputCost: 0,
+        outputCost: 0,
+        peak: zeroTokens(),
+        off: zeroTokens(),
+        amounts: {
+          miss: { peak: 0, off: 0 },
+          hit: { peak: 0, off: 0 },
+          output: { peak: 0, off: 0 },
+        },
+        models: [],
+        split: true,
+      };
+      for (const [modelId, periods] of Object.entries(modelPeriods ?? {})) {
+        const rates = ratesFor(table, modelId, fallbackModel);
+        if (rates === undefined) continue;
+        let modelTotal = 0;
+        for (const period of ['peak', 'off']) {
+          const bucket = periods[period];
+          const rate = period === 'peak' ? rates.peak : rates.offPeak;
+          if (bucket === null || typeof bucket !== 'object' || rate === undefined) continue;
+          const priced = priceTokens(bucket, rate);
+          ledger.cacheHitCost += priced.cacheHitCost;
+          ledger.inputCost += priced.inputCost;
+          ledger.outputCost += priced.outputCost;
+          ledger.total += priced.total;
+          modelTotal += priced.total;
+          addBuckets(ledger[period], bucket);
+          ledger.amounts.miss[period] += ((bucket.inputTokens ?? 0) + (bucket.cacheWriteTokens ?? 0)) / 1_000_000 * rate.miss;
+          ledger.amounts.hit[period] += (bucket.cacheReadTokens ?? 0) / 1_000_000 * rate.hit;
+          ledger.amounts.output[period] += (bucket.outputTokens ?? 0) / 1_000_000 * rate.output;
+        }
+        if (tokensTotal(periods.peak) + tokensTotal(periods.off) > 0) {
+          ledger.models.push({ model: modelId, rates, periods, total: modelTotal });
+        }
+      }
+      return ledger;
+    }
+
+    /**
+     * Build the per-model ledger for one session.
+     *
+     * The aggregate `periods` and the per-model `models` can cover different
+     * spans: after a Host upgrade, old requests have periods but no model, and a
+     * long session may also have pre-Host history that only the browser total
+     * knows about. Both gaps are assigned to the selected fallback model on the
+     * conservative side, so the sum always reconstructs the full token count.
+     */
+    function sessionModelPeriods(session, historicalGap, fallbackModel, peakNow) {
+      const t = session?.tokens ?? zeroTokens();
+      const periods = session?.periods;
+      const hasPeriods = periods !== null && typeof periods === 'object';
+      const classified = hasPeriods ? periodsTokens(periods) : zeroTokens();
+      const unclassified = subtractBuckets(t, classified);
+      const hasHistory = historicalGap !== undefined;
+      const frozen = hasPeriods
+        ? (hasHistory ? minBuckets(historicalGap, unclassified) : unclassified)
+        : zeroTokens();
+      const live = hasPeriods && hasHistory ? subtractBuckets(unclassified, frozen) : zeroTokens();
+      const modelPeriods = modelPeriodsFrom(session?.models);
+      if (Object.keys(modelPeriods).length === 0 && hasPeriods) {
+        modelPeriods[fallbackModel] = { peak: zeroTokens(), off: zeroTokens() };
+        addBuckets(modelPeriods[fallbackModel].peak, periods.peak);
+        addBuckets(modelPeriods[fallbackModel].off, periods.off);
+      }
+      if (modelPeriods[fallbackModel] === undefined) {
+        modelPeriods[fallbackModel] = { peak: zeroTokens(), off: zeroTokens() };
+      }
+      // Periods recorded before Host v6 have no model key; keep those tokens.
+      const modelPeak = zeroTokens();
+      const modelOff = zeroTokens();
+      for (const pair of Object.values(modelPeriods)) {
+        addBuckets(modelPeak, pair.peak);
+        addBuckets(modelOff, pair.off);
+      }
+      if (hasPeriods) {
+        const missingPeak = subtractBuckets(periods.peak ?? zeroTokens(), modelPeak);
+        const missingOff = subtractBuckets(periods.off ?? zeroTokens(), modelOff);
+        addBuckets(modelPeriods[fallbackModel].peak, missingPeak);
+        addBuckets(modelPeriods[fallbackModel].off, missingOff);
+        // The pre-Host history and the live poll lag are model-less; assign them
+        // to the fallback model, peak first (the same rule as before this change).
+        addBuckets(modelPeriods[fallbackModel].peak, frozen);
+        if (hasHistory) {
+          addBuckets(modelPeriods[fallbackModel][peakNow === false ? 'off' : 'peak'], live);
+        }
+      } else {
+        // No period split at all: the only source is the browser total. Add
+        // whatever the model map did not cover, once — not the whole total.
+        const modelAll = zeroTokens();
+        addBuckets(modelAll, modelPeak);
+        addBuckets(modelAll, modelOff);
+        addBuckets(modelPeriods[fallbackModel].peak, subtractBuckets(t, modelAll));
+      }
+      return { modelPeriods, hasPeriods, frozen, live, unclassified };
+    }
+
     /**
      * Convert dsh-context's raw cost buckets into the display's peak/off shape.
      * This lets the peak/off rows show the full session even when the Host has
@@ -557,6 +755,7 @@ window.__ModuleLoader__.load({
      */
     function isPeakTime(time) {
       if (typeof time !== 'number' || !Number.isFinite(time)) return false;
+      if (CN_HOLIDAYS.has(beijingDayKey(time))) return false;
       const beijing = new Date(time + 8 * 60 * 60 * 1000);
       const day = beijing.getUTCDay();
       const hour = beijing.getUTCHours();
@@ -594,6 +793,20 @@ window.__ModuleLoader__.load({
         saw = true;
       }
       return saw ? periods : undefined;
+    }
+
+    /** Merge the per-model buckets carried by interaction records. */
+    function modelsFromRecords(records) {
+      if (!Array.isArray(records)) return undefined;
+      const models = {};
+      let saw = false;
+      for (const record of records) {
+        if (record === null || typeof record !== 'object') continue;
+        if (record.models === null || typeof record.models !== 'object') continue;
+        mergeModelPeriods(models, record.models);
+        saw = true;
+      }
+      return saw ? models : undefined;
     }
 
     /** Group digits for readability: `1234567` → `1,234,567`. */
@@ -1700,7 +1913,7 @@ window.__ModuleLoader__.load({
      * so the per-episode rows and the session total are priced by the same rule
      * and always agree.
      */
-    function AccountSection({ session, records, todayRecords, requests, historicalGap, rate, model, models, table, currency, symbol, peak, balance, onModel, onCurrency }) {
+    function AccountSection({ session, records, todayRecords, sessions, requests, historicalGap, rate, model, models, table, currency, symbol, peak, balance, onModel, onCurrency }) {
       if (session === undefined || session.tokens === undefined) {
         return h(
           'div',
@@ -1733,62 +1946,85 @@ window.__ModuleLoader__.load({
         0,
       );
 
-      /** Calendar-day rollup across all sessions the pet has records for. */
-      const dayStart = new Date();
-      dayStart.setHours(0, 0, 0, 0);
-      const todayStart = dayStart.getTime();
-      const today = (Array.isArray(todayRecords) ? todayRecords : records).filter((record) => {
-        const at = typeof record.endedAt === 'number' ? record.endedAt : record.startedAt;
-        return typeof at === 'number' && at >= todayStart;
-      });
+      /**
+       * Calendar-day rollup.
+       *
+       * Host v6 keeps a per-session day ledger, so "Today" covers every session
+       * the Host has seen today — including the one still running — and survives
+       * a restart. Older Hosts only expose records, so fall back to those.
+       */
+      const dayKey = beijingDayKey(Date.now());
+      const hostDays = (Array.isArray(sessions) ? sessions : [])
+        .map((row) => row?.today)
+        .filter((day) => day !== undefined && day.date === dayKey);
+      const useHostToday = hostDays.length > 0 && hostDays.some((day) => tokensTotal(day.tokens) > 0);
       const todayTokens = zeroTokens();
       const todayPeriods = { peak: zeroTokens(), off: zeroTokens() };
-      for (const record of today) {
-        const bucket = record.tokens;
-        if (bucket !== null && typeof bucket === 'object') addBuckets(todayTokens, bucket);
-        const recordPeriods = periodsFromRecords([record]);
-        if (recordPeriods !== undefined) {
-          addBuckets(todayPeriods.peak, recordPeriods.peak);
-          addBuckets(todayPeriods.off, recordPeriods.off);
-        } else if (bucket !== null && typeof bucket === 'object') {
-          // No timestamp/periods at all: historical gap, count it as peak.
-          addBuckets(todayPeriods.peak, bucket);
+      const todayModels = {};
+      let todayCount = 0;
+      if (useHostToday) {
+        for (const day of hostDays) {
+          addBuckets(todayTokens, day.tokens);
+          addBuckets(todayPeriods.peak, day.periods?.peak);
+          addBuckets(todayPeriods.off, day.periods?.off);
+          mergeModelPeriods(todayModels, day.models);
+          todayCount += day.tokens?.requests ?? 0;
         }
+        // A v1 store's records can seed today with periods but no model map, and
+        // a mid-day upgrade leaves the old part model-less. Fill that gap on the
+        // selected model so the per-model ledger still sums to today's total.
+        if (Object.keys(todayModels).length > 0) {
+          if (todayModels[model] === undefined) todayModels[model] = { peak: zeroTokens(), off: zeroTokens() };
+          const modelPeak = zeroTokens();
+          const modelOff = zeroTokens();
+          for (const pair of Object.values(todayModels)) {
+            addBuckets(modelPeak, pair.peak);
+            addBuckets(modelOff, pair.off);
+          }
+          addBuckets(todayModels[model].peak, subtractBuckets(todayPeriods.peak, modelPeak));
+          addBuckets(todayModels[model].off, subtractBuckets(todayPeriods.off, modelOff));
+        }
+      } else {
+        const dayStart = new Date();
+        dayStart.setHours(0, 0, 0, 0);
+        const todayStart = dayStart.getTime();
+        const today = (Array.isArray(todayRecords) ? todayRecords : records).filter((record) => {
+          const at = typeof record.endedAt === 'number' ? record.endedAt : record.startedAt;
+          return typeof at === 'number' && at >= todayStart;
+        });
+        for (const record of today) {
+          const bucket = record.tokens;
+          if (bucket !== null && typeof bucket === 'object') addBuckets(todayTokens, bucket);
+          mergeModelPeriods(todayModels, record.models);
+          const recordPeriods = periodsFromRecords([record]);
+          if (recordPeriods !== undefined) {
+            addBuckets(todayPeriods.peak, recordPeriods.peak);
+            addBuckets(todayPeriods.off, recordPeriods.off);
+          } else if (bucket !== null && typeof bucket === 'object') {
+            // No timestamp/periods at all: historical gap, count it as peak.
+            addBuckets(todayPeriods.peak, bucket);
+          }
+        }
+        todayCount = today.length;
       }
       const todayBilled = tokensTotal(todayTokens);
-      const todayCost = pricePeriods(todayPeriods, table, model) ?? priceTokens(todayTokens, rate);
-      const hasPeriods = session.periods !== null && typeof session.periods === 'object';
+      const todayLedger = Object.keys(todayModels).length > 0 ? priceModelLedger(todayModels, table, model) : undefined;
+      const todayCost = todayLedger !== undefined && todayLedger.models.length > 0
+        ? todayLedger
+        : priceOrFlat(todayPeriods, todayTokens, table, model, rate);
       const peakRate = table?.models?.[model]?.peak ?? rate;
       const offRate = table?.models?.[model]?.offPeak ?? rate;
-      // There is no third state: a token is either peak or off-peak. Tokens
-      // without a recorded period are historical gaps; assign them to peak
-      // (the conservative side) rather than inventing "unclassified".
-      const classified = hasPeriods ? periodsTokens(session.periods) : zeroTokens();
-      const unclassified = subtractBuckets(t, classified);
-      // Historical tokens (the part of the gap frozen on first observation) stay
-      // peak. Only the *growth* of the gap is live poll lag and goes to the
-      // current period. Until a baseline exists, keep the whole gap in peak:
-      // moving it to off would silently erase the historical peak.
-      const hasHistory = historicalGap !== undefined;
-      const frozen = hasPeriods
-        ? (hasHistory ? minBuckets(historicalGap, unclassified) : unclassified)
-        : zeroTokens();
-      const live = hasPeriods && hasHistory ? subtractBuckets(unclassified, frozen) : zeroTokens();
+      const { modelPeriods } = sessionModelPeriods(session, historicalGap, model, peak);
+      const ledger = priceModelLedger(modelPeriods, table, model);
+      const shownCost = ledger.models.length > 0
+        ? ledger
+        : priceOrFlat(session.periods, t, table, model, rate);
       const peakBucket = zeroTokens();
-      if (hasPeriods) addBuckets(peakBucket, session.periods.peak);
-      addBuckets(peakBucket, hasPeriods ? frozen : unclassified);
       const offBucket = zeroTokens();
-      if (hasPeriods) addBuckets(offBucket, session.periods.off);
-      if (hasPeriods && hasHistory) addBuckets(peak === false ? offBucket : peakBucket, live);
-      const peakCost = priceTokens(peakBucket, peakRate);
-      const offCost = priceTokens(offBucket, offRate);
-      const shownCost = {
-        cacheHitCost: peakCost.cacheHitCost + offCost.cacheHitCost,
-        inputCost: peakCost.inputCost + offCost.inputCost,
-        outputCost: peakCost.outputCost + offCost.outputCost,
-        total: peakCost.total + offCost.total,
-        split: true,
-      };
+      for (const pair of Object.values(modelPeriods)) {
+        addBuckets(peakBucket, pair.peak);
+        addBuckets(offBucket, pair.off);
+      }
       const missPeak = peakBucket.inputTokens + peakBucket.cacheWriteTokens;
       const missOff = offBucket.inputTokens + offBucket.cacheWriteTokens;
       const breakdownRows = [
@@ -1796,22 +2032,22 @@ window.__ModuleLoader__.load({
           label: '输入 · 缓存未命中 Cache miss',
           peak: missPeak,
           off: missOff,
-          peakAmount: (missPeak / 1_000_000) * peakRate.miss,
-          offAmount: (missOff / 1_000_000) * offRate.miss,
+          peakAmount: ledger.amounts.miss.peak,
+          offAmount: ledger.amounts.miss.off,
         },
         {
           label: '输入 · 缓存命中 Cache hit',
           peak: peakBucket.cacheReadTokens,
           off: offBucket.cacheReadTokens,
-          peakAmount: (peakBucket.cacheReadTokens / 1_000_000) * peakRate.hit,
-          offAmount: (offBucket.cacheReadTokens / 1_000_000) * offRate.hit,
+          peakAmount: ledger.amounts.hit.peak,
+          offAmount: ledger.amounts.hit.off,
         },
         {
           label: '输出 Output',
           peak: peakBucket.outputTokens,
           off: offBucket.outputTokens,
-          peakAmount: (peakBucket.outputTokens / 1_000_000) * peakRate.output,
-          offAmount: (offBucket.outputTokens / 1_000_000) * offRate.output,
+          peakAmount: ledger.amounts.output.peak,
+          offAmount: ledger.amounts.output.off,
         },
       ];
 
@@ -1987,7 +2223,7 @@ window.__ModuleLoader__.load({
           { className: `${PREFIX}-kv` },
           h('span', { className: `${PREFIX}-k` }, '今日计费 token Billed'),
           h('span', { className: `${PREFIX}-v` }, todayBilled > 0 ? count(todayBilled) : '—'),
-          h('span', { className: `${PREFIX}-note` }, `${today.length} 次交互 · 跨会话`),
+          h('span', { className: `${PREFIX}-note` }, `${todayCount} 次交互 · 跨会话`),
         ),
         h(
           'div',
@@ -2003,18 +2239,28 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: `${PREFIX}-note ${PREFIX}-acctnote` },
-          '今日统计基于宠物保留的交互记录（最多 80 条），跨会话汇总；有峰/谷记录时按请求时段计价，缺失时段的归入忙时。',
+          useHostToday
+            ? '今日统计来自 Host 的按日账本，覆盖所有会话（含正在运行的本会话），Host 重启后仍在。'
+            : '今日统计基于宠物保留的交互记录（最多 80 条），跨会话汇总；有峰/谷记录时按请求时段计价，缺失时段的归入忙时。',
         ),
         h(
           'div',
           { className: `${PREFIX}-note ${PREFIX}-acctnote` },
-          `价格 ${models[model].label}（${table.label}）：忙时 命中 ${symbol}${peakRate.hit}/M · 未命中 ${symbol}${peakRate.miss}/M · 输出 ${symbol}${peakRate.output}/M`,
+          ...(ledger.models.length > 1
+            ? [
+                `按实际模型计价：${ledger.models.map((item) => `${item.model} ${money(item.total, symbol)}`).join(' · ')}`,
+                h('br'),
+                `各模型忙时：${ledger.models.map((item) => `${item.model} 命中 ${symbol}${item.rates.peak.hit}/M · 未命中 ${symbol}${item.rates.peak.miss}/M · 输出 ${symbol}${item.rates.peak.output}/M`).join('；')}`,
+              ]
+            : [
+                `价格 ${models[model].label}（${table.label}）：忙时 命中 ${symbol}${peakRate.hit}/M · 未命中 ${symbol}${peakRate.miss}/M · 输出 ${symbol}${peakRate.output}/M`,
+                h('br'),
+                `闲时 命中 ${symbol}${offRate.hit}/M · 未命中 ${symbol}${offRate.miss}/M · 输出 ${symbol}${offRate.output}/M（每 1M token）`,
+              ]),
           h('br'),
-          `闲时 命中 ${symbol}${offRate.hit}/M · 未命中 ${symbol}${offRate.miss}/M · 输出 ${symbol}${offRate.output}/M（每 1M token）`,
+          '计费口径：DeepSeek 官方规定（峰时 / 谷时 + 法定节假日）；LiteLLM 网关按官方结算，面板不另加网关价。',
           h('br'),
-          '费率来源：DeepSeek 官方价目（CNY / USD 两套表，2026-10-23）；谷价 = 峰价 ÷ 2。',
-          h('br'),
-          '高峰时段为北京时间周一至周五 09–12、14–18 点（即 UTC 01–04、06–10）；中国法定节假日按低谷计费，此处未扣除，因此节假日可能高估。',
+          '高峰时段为北京时间周一至周五 09–12、14–18 点（即 UTC 01–04、06–10）；已内置 2026 年法定节假日并按低谷计费，2027 年需更新节假日表。',
           h('br'),
           'dsh-context 的 Context Stats 以 models.dev 谷价 ×2 估算，与官方 USD 价目一致；两边仍不同时，通常来自自定义 provider 的模型映射或实际账单折扣。',
           session.source === 'client'
@@ -2040,13 +2286,17 @@ window.__ModuleLoader__.load({
             )
           : null,
         records.slice(0, 12).map((record) => {
+          const recordModels = modelPeriodsFrom(record.models);
+          const modelLedger = Object.keys(recordModels).length > 0 ? priceModelLedger(recordModels, table, model) : undefined;
           const recordPeriods = periodsFromRecords([record]) ?? (record.tokens === undefined ? undefined : { peak: record.tokens, off: zeroTokens() });
           const splitRecord = record.tokens === undefined ? undefined : pricePeriods(recordPeriods, table, model);
           const recordCost = record.tokens === undefined
             ? undefined
-            : splitRecord !== undefined && (splitRecord.total > 0 || tokensTotal(record.tokens) === 0)
-              ? splitRecord
-              : priceTokens(record.tokens, peakRate);
+            : modelLedger !== undefined && modelLedger.models.length > 0
+              ? modelLedger
+              : splitRecord !== undefined && (splitRecord.total > 0 || tokensTotal(record.tokens) === 0)
+                ? splitRecord
+                : priceTokens(record.tokens, peakRate);
           return h(
             'div',
             { className: `${PREFIX}-kv`, key: `tok-${record.sessionId}-${record.startedAt}` },
@@ -2747,6 +2997,8 @@ window.__ModuleLoader__.load({
         if (accountingSession === undefined) return accountingSession;
         const hostPeriods = accountingSession.periods;
         const recordPeriods = periodsFromRecords(accountingRecords);
+        const hostModels = accountingSession.models;
+        const recordModels = modelsFromRecords(accountingRecords);
         const hostTotal = hostPeriods === undefined ? 0 : tokensTotal(periodsTokens(hostPeriods));
         const recordTotal = recordPeriods === undefined ? 0 : tokensTotal(periodsTokens(recordPeriods));
         const contextPeriods = periodsFromCostUsage(context?.cost);
@@ -2756,15 +3008,15 @@ window.__ModuleLoader__.load({
         // A context cost bucket can be a whole-session list-price bucket (all
         // under `peak`) and must never hide a real off-peak Host/record split.
         const candidates = [];
-        if (hostTotal > 0) candidates.push({ periods: hostPeriods, total: hostTotal, source: 'host' });
-        if (recordTotal > 0) candidates.push({ periods: recordPeriods, total: recordTotal, source: 'records' });
+        if (hostTotal > 0) candidates.push({ periods: hostPeriods, total: hostTotal, source: 'host', models: hostModels });
+        if (recordTotal > 0) candidates.push({ periods: recordPeriods, total: recordTotal, source: 'records', models: recordModels });
         candidates.sort((left, right) => right.total - left.total);
         if (candidates.length === 0 && contextTotal > 0) {
           candidates.push({ periods: contextPeriods, total: contextTotal, source: 'context' });
         }
         if (candidates.length === 0) return accountingSession;
         const best = candidates[0];
-        return { ...accountingSession, periods: best.periods, periodsSource: best.source };
+        return { ...accountingSession, periods: best.periods, periodsSource: best.source, models: best.models };
       }, [accountingSession, accountingRecords, context]);
 
       /**
@@ -3054,6 +3306,7 @@ window.__ModuleLoader__.load({
                   session: displaySession,
                   records: accountingRecords,
                   todayRecords: records,
+                  sessions: hostState.sessions,
                   historicalGap: periodBaseline,
                   requests: context?.steps || accountingSession?.tokens?.requests || 0,
                   rate,
