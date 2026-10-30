@@ -1589,6 +1589,7 @@ window.__ModuleLoader__.load({
 .${PREFIX}-bdhead{font-size:9.5px;font-weight:600;color:var(--dsw-alias-label-secondary,#6b7280);letter-spacing:.02em}
 .${PREFIX}-bdk{color:var(--dsw-alias-label-secondary,#6b7280);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .${PREFIX}-bdnum{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;font-size:10.5px}
+.${PREFIX}-bdtot{margin-top:2px;padding-top:3px;border-top:1px dashed var(--dsw-alias-border-l1,rgba(0,0,0,.12));font-weight:600}
 .${PREFIX}-bdnum small{display:block;font-size:9.5px;color:var(--dsw-alias-label-secondary,#6b7280);font-weight:400;line-height:1.2}
 .${PREFIX}-kv{display:grid;grid-template-columns:1fr auto auto;align-items:baseline;gap:8px;font-size:11.5px;line-height:1.5}
 .${PREFIX}-k{color:var(--dsw-alias-label-secondary,#6b7280);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -2262,6 +2263,23 @@ window.__ModuleLoader__.load({
               ),
             ),
           ),
+          h(
+            'div',
+            { className: `${PREFIX}-bdrow ${PREFIX}-bdtot` },
+            h('span', { className: `${PREFIX}-bdk` }, '合计 Total'),
+            h(
+              'span',
+              { className: `${PREFIX}-bdnum` },
+              count(peakSummary.hit + peakSummary.miss + peakSummary.out),
+              h('small', null, money(peakSummary.cost, symbol)),
+            ),
+            h(
+              'span',
+              { className: `${PREFIX}-bdnum` },
+              count(offSummary.hit + offSummary.miss + offSummary.out),
+              h('small', null, money(offSummary.cost, symbol)),
+            ),
+          ),
         ),
         t.cacheWriteTokens > 0
           ? h(
@@ -2270,33 +2288,10 @@ window.__ModuleLoader__.load({
               `缓存写入 ${count(t.cacheWriteTokens)} 按 miss 计费，已包含在“缓存未命中”行。`,
             )
           : null,
-        h('div', { className: `${PREFIX}-sectsub` }, '分时段汇总 · Period totals'),
-        h(
-          'div',
-          { className: `${PREFIX}-kv` },
-          h('span', { className: `${PREFIX}-k` }, '忙时合计 Peak'),
-          h('span', { className: `${PREFIX}-v` }, money(peakSummary.cost, symbol)),
-          h(
-            'span',
-            { className: `${PREFIX}-note` },
-            `输入 命中 ${count(peakSummary.hit)} · 未命中 ${count(peakSummary.miss)} · 输出 ${count(peakSummary.out)}`,
-          ),
-        ),
-        h(
-          'div',
-          { className: `${PREFIX}-kv` },
-          h('span', { className: `${PREFIX}-k` }, '闲时合计 Off-peak'),
-          h('span', { className: `${PREFIX}-v` }, money(offSummary.cost, symbol)),
-          h(
-            'span',
-            { className: `${PREFIX}-note` },
-            `输入 命中 ${count(offSummary.hit)} · 未命中 ${count(offSummary.miss)} · 输出 ${count(offSummary.out)}`,
-          ),
-        ),
         h(
           'div',
           { className: `${PREFIX}-kv ${PREFIX}-kvtot` },
-          h('span', { className: `${PREFIX}-k` }, '合计 Total'),
+          h('span', { className: `${PREFIX}-k` }, '总合计 Grand total'),
           h('span', { className: `${PREFIX}-v` }, money(shownCost.total, symbol)),
           h(
             'span',
