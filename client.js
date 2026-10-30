@@ -120,6 +120,8 @@ window.__ModuleLoader__.load({
     const RATE_MODEL_KEY = `${STORAGE_KEY}.rateModel`;
     /** Chosen currency, overridable in localStorage. */
     const RATE_CURRENCY_KEY = `${STORAGE_KEY}.rateCurrency`;
+    /** Cache of the Host's 30-day ledger, so a Host restart cannot blank the view. */
+    const HISTORY_CACHE_KEY = `${STORAGE_KEY}.history.v1`;
     /** Whole-table override, as JSON, for when the published prices move. */
     const RATE_OVERRIDE_KEY = `${STORAGE_KEY}.rates`;
     /**
@@ -472,6 +474,35 @@ window.__ModuleLoader__.load({
     /** A zeroed bucket set for the client-side rollups. */
     function zeroTokens() {
       return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, requests: 0 };
+    }
+
+    /** One usable day in the 30-day cache. */
+    function isHistoryDay(day) {
+      return day !== null
+        && typeof day === 'object'
+        && typeof day.date === 'string'
+        && /^\d{4}-\d{2}-\d{2}$/u.test(day.date)
+        && day.tokens !== null
+        && typeof day.tokens === 'object';
+    }
+
+    function readHistoryCache() {
+      try {
+        const parsed = JSON.parse(window.localStorage.getItem(HISTORY_CACHE_KEY) ?? 'null');
+        if (parsed === null || typeof parsed !== 'object' || !Array.isArray(parsed.days)) return [];
+        return parsed.days.filter(isHistoryDay).slice(-30);
+      } catch {
+        return [];
+      }
+    }
+
+    function mergeHistoryDays(...lists) {
+      const byDate = new Map();
+      for (const list of lists) {
+        if (!Array.isArray(list)) continue;
+        for (const day of list) if (isHistoryDay(day)) byDate.set(day.date, day);
+      }
+      return [...byDate.values()].sort((left, right) => left.date.localeCompare(right.date)).slice(-30);
     }
 
     /** Add one bucket set into another. */
@@ -2617,6 +2648,27 @@ window.__ModuleLoader__.load({
       const useSessionStatus = props.useSessionStatus;
 
       const [hostState, setHostState] = useState({ ok: false, busy: false, active: [], records: [], feed: [], sessions: [], history: [], approvals: [], balance: undefined, now: undefined });
+      const [historyCache, setHistoryCache] = useState(readHistoryCache);
+      const displayHistory = useMemo(
+        () => mergeHistoryDays(historyCache, hostState.history),
+        [historyCache, hostState.history],
+      );
+      useEffect(() => {
+        const incoming = Array.isArray(hostState.history) ? hostState.history : [];
+        if (incoming.length === 0) return;
+        setHistoryCache((previous) => {
+          const merged = mergeHistoryDays(previous, incoming);
+          if (merged.length === previous.length && merged.every((day, index) => day === previous[index])) {
+            return previous;
+          }
+          try {
+            window.localStorage.setItem(HISTORY_CACHE_KEY, JSON.stringify({ version: 1, days: merged }));
+          } catch {
+            /* localStorage may be full or unavailable */
+          }
+          return merged;
+        });
+      }, [hostState.history]);
       const [open, setOpen] = useState(false);
       const [mood, setMood] = useState('calm');
       const [soundOn, setSoundOn] = useState(true);
@@ -3403,7 +3455,7 @@ window.__ModuleLoader__.load({
                   records: accountingRecords,
                   todayRecords: records,
                   sessions: hostState.sessions,
-                  history: hostState.history,
+                  history: displayHistory,
                   historicalGap: periodBaseline,
                   requests: context?.steps || accountingSession?.tokens?.requests || 0,
                   rate,
