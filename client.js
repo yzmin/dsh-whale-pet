@@ -1565,6 +1565,9 @@ window.__ModuleLoader__.load({
 .${PREFIX}-kv .${PREFIX}-note{font-variant-numeric:tabular-nums;min-width:62px;text-align:right}
 .${PREFIX}-kvtot{margin-top:3px;padding-top:4px;border-top:1px dashed var(--dsw-alias-border-l1,rgba(0,0,0,.12));font-size:12.5px}
 .${PREFIX}-acctnote{margin-top:5px;line-height:1.55;text-align:left;white-space:normal}
+.${PREFIX}-daytoggle{margin:4px 0 2px;font-size:11px;padding:2px 8px}
+.${PREFIX}-daylist{max-height:180px;overflow:auto;margin-top:2px;padding-top:3px;border-top:1px dashed var(--dsw-alias-border-l1,rgba(0,0,0,.12))}
+.${PREFIX}-daylist .${PREFIX}-kv{margin:1px 0}
 .${PREFIX}-sel{font:inherit;font-size:11px;padding:2px 5px;border-radius:6px;max-width:150px;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.14));background:var(--dsw-alias-bg-layer-1,transparent);color:var(--dsw-alias-label-primary,#1b1b1f)}
 .${PREFIX}-sels{display:flex;align-items:center;gap:5px;flex:none}
 .${PREFIX}-sels .${PREFIX}-sel{max-width:96px}
@@ -1913,7 +1916,8 @@ window.__ModuleLoader__.load({
      * so the per-episode rows and the session total are priced by the same rule
      * and always agree.
      */
-    function AccountSection({ session, records, todayRecords, sessions, requests, historicalGap, rate, model, models, table, currency, symbol, peak, balance, onModel, onCurrency }) {
+    function AccountSection({ session, records, todayRecords, sessions, history, requests, historicalGap, rate, model, models, table, currency, symbol, peak, balance, onModel, onCurrency }) {
+      const [showHistory, setShowHistory] = useState(false);
       if (session === undefined || session.tokens === undefined) {
         return h(
           'div',
@@ -2012,6 +2016,19 @@ window.__ModuleLoader__.load({
       const todayCost = todayLedger !== undefined && todayLedger.models.length > 0
         ? todayLedger
         : priceOrFlat(todayPeriods, todayTokens, table, model, rate);
+      const historyRows = (Array.isArray(history) ? history : [])
+        .filter((day) => day !== null && typeof day === 'object' && typeof day.date === 'string')
+        .map((day) => {
+          const tokens = day.tokens ?? zeroTokens();
+          const hasModels = Object.keys(day.models ?? {}).length > 0;
+          const priced = hasModels
+            ? priceModelLedger(day.models, table, model)
+            : priceOrFlat(day.periods ?? {}, tokens, table, model, rate);
+          return { date: day.date, tokens: tokensTotal(tokens), cost: priced.total };
+        })
+        .filter((day) => day.tokens > 0)
+        .sort((left, right) => right.date.localeCompare(left.date));
+      const historyTotal = historyRows.reduce((sum, day) => sum + day.cost, 0);
       const peakRate = table?.models?.[model]?.peak ?? rate;
       const offRate = table?.models?.[model]?.offPeak ?? rate;
       const { modelPeriods } = sessionModelPeriods(session, historicalGap, model, peak);
@@ -2050,6 +2067,22 @@ window.__ModuleLoader__.load({
           offAmount: ledger.amounts.output.off,
         },
       ];
+      const summarizePeriod = (bucket, period) => {
+        const hit = bucket.cacheReadTokens;
+        const miss = bucket.inputTokens + bucket.cacheWriteTokens;
+        const out = bucket.outputTokens;
+        const priced = period === 'peak'
+          ? ledger.amounts.hit.peak + ledger.amounts.miss.peak + ledger.amounts.output.peak
+          : ledger.amounts.hit.off + ledger.amounts.miss.off + ledger.amounts.output.off;
+        return {
+          hit,
+          miss,
+          out,
+          cost: priced > 0 ? priced : priceTokens(bucket, period === 'peak' ? peakRate : offRate).total,
+        };
+      };
+      const peakSummary = summarizePeriod(peakBucket, 'peak');
+      const offSummary = summarizePeriod(offBucket, 'off');
 
       /** One label/value row inside the grid. */
       const row = (label, value, extra) =>
@@ -2206,6 +2239,29 @@ window.__ModuleLoader__.load({
               `缓存写入 ${count(t.cacheWriteTokens)} 按 miss 计费，已包含在“缓存未命中”行。`,
             )
           : null,
+        h('div', { className: `${PREFIX}-sectsub` }, '分时段汇总 · Period totals'),
+        h(
+          'div',
+          { className: `${PREFIX}-kv` },
+          h('span', { className: `${PREFIX}-k` }, '忙时合计 Peak'),
+          h('span', { className: `${PREFIX}-v` }, money(peakSummary.cost, symbol)),
+          h(
+            'span',
+            { className: `${PREFIX}-note` },
+            `输入 命中 ${count(peakSummary.hit)} · 未命中 ${count(peakSummary.miss)} · 输出 ${count(peakSummary.out)}`,
+          ),
+        ),
+        h(
+          'div',
+          { className: `${PREFIX}-kv` },
+          h('span', { className: `${PREFIX}-k` }, '闲时合计 Off-peak'),
+          h('span', { className: `${PREFIX}-v` }, money(offSummary.cost, symbol)),
+          h(
+            'span',
+            { className: `${PREFIX}-note` },
+            `输入 命中 ${count(offSummary.hit)} · 未命中 ${count(offSummary.miss)} · 输出 ${count(offSummary.out)}`,
+          ),
+        ),
         h(
           'div',
           { className: `${PREFIX}-kv ${PREFIX}-kvtot` },
@@ -2243,6 +2299,45 @@ window.__ModuleLoader__.load({
             ? '今日统计来自 Host 的按日账本，覆盖所有会话（含正在运行的本会话），Host 重启后仍在。'
             : '今日统计基于宠物保留的交互记录（最多 80 条），跨会话汇总；有峰/谷记录时按请求时段计价，缺失时段的归入忙时。',
         ),
+        historyRows.length > 0
+          ? h(
+              'div',
+              null,
+              h('div', { className: `${PREFIX}-sectsub` }, '近30天 · Last 30 days'),
+              h(
+                'div',
+                { className: `${PREFIX}-kv` },
+                h('span', { className: `${PREFIX}-k` }, '30天合计'),
+                h('span', { className: `${PREFIX}-v` }, money(historyTotal, symbol)),
+                h('span', { className: `${PREFIX}-note` }, `${historyRows.length} 天`),
+              ),
+              h(
+                'button',
+                {
+                  className: `${PREFIX}-btn ${PREFIX}-daytoggle`,
+                  type: 'button',
+                  onClick: () => setShowHistory((value) => !value),
+                  'aria-expanded': showHistory,
+                },
+                showHistory ? '收起每日' : '展开每日',
+              ),
+              showHistory
+                ? h(
+                    'div',
+                    { className: `${PREFIX}-daylist` },
+                    historyRows.map((day) =>
+                      h(
+                        'div',
+                        { className: `${PREFIX}-kv`, key: day.date },
+                        h('span', { className: `${PREFIX}-k`, title: day.date }, day.date.slice(5)),
+                        h('span', { className: `${PREFIX}-v` }, count(day.tokens)),
+                        h('span', { className: `${PREFIX}-note` }, money(day.cost, symbol)),
+                      ),
+                    ),
+                  )
+                : null,
+            )
+          : null,
         h(
           'div',
           { className: `${PREFIX}-note ${PREFIX}-acctnote` },
@@ -2521,7 +2616,7 @@ window.__ModuleLoader__.load({
       const useSessions = props.useSessions;
       const useSessionStatus = props.useSessionStatus;
 
-      const [hostState, setHostState] = useState({ ok: false, busy: false, active: [], records: [], feed: [], sessions: [], approvals: [], balance: undefined, now: undefined });
+      const [hostState, setHostState] = useState({ ok: false, busy: false, active: [], records: [], feed: [], sessions: [], history: [], approvals: [], balance: undefined, now: undefined });
       const [open, setOpen] = useState(false);
       const [mood, setMood] = useState('calm');
       const [soundOn, setSoundOn] = useState(true);
@@ -2628,6 +2723,7 @@ window.__ModuleLoader__.load({
               records: Array.isArray(body?.records) ? body.records : [],
               feed: Array.isArray(body?.feed) ? body.feed : [],
               sessions: Array.isArray(body?.sessions) ? body.sessions : [],
+              history: Array.isArray(body?.history) ? body.history : [],
               approvals: Array.isArray(body?.approvals) ? body.approvals : [],
               balance: body?.balance !== null && typeof body?.balance === 'object' ? body.balance : undefined,
               now: typeof body?.now === 'number' ? body.now : undefined,
@@ -3307,6 +3403,7 @@ window.__ModuleLoader__.load({
                   records: accountingRecords,
                   todayRecords: records,
                   sessions: hostState.sessions,
+                  history: hostState.history,
                   historicalGap: periodBaseline,
                   requests: context?.steps || accountingSession?.tokens?.requests || 0,
                   rate,

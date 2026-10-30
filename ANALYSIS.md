@@ -3,7 +3,7 @@
 | 项 | 值 |
 |---|---|
 | 被分析版本 | `dsh-whale-pet@1.0.0`（profile 中由 GitHub tarball 安装） |
-| 优化版本 | `1.6.0`（1.5.1 费率回退官方价目；1.6.0 补节假日、按实际模型计价、Host 按日账本） |
+| 优化版本 | `1.7.0`（1.5.1 费率回退官方价目；1.6.0 补节假日、按实际模型计价、Host 按日账本；1.7.0 分时段汇总 + 近 30 天每日费用） |
 | 对照插件 | `dsh-context@0.73.3` |
 | 运行环境 | DeepSeek Harness Web GUI（profile `desktop`） |
 | 改动范围 | Host `index.js`（待授权折叠）+ Browser `client.js`（上下文面板 / 紧急音 / 轮询） |
@@ -60,6 +60,7 @@
 | 21 | **重启后今日用量清零** | `Today` 由浏览器端 `records` 按本地日期汇总，而 `records` 只在 Host 内存里；DSH 重启后记录清空，今日 token / 费用变成 `—`。 | 把 `records` 一并写入 `periods.json`，Host apply 时恢复并恢复 `nextId`；今日统计随记录一起跨重启保留（v1.4.10）。仍受 80 条记录窗口限制。 |
 | 22 | **内置费率与 dsh-context 的 models.dev 估价差距大** | 旧表 `deepseek-flash` 为 miss ¥2/M、output ¥8/M，而 models.dev DeepSeek V4 Flash 为 $0.14/$0.28（cache read $0.0028）；同一会话宠物算 ¥1.00，dsh-context 约 $0.08/¥0.08，量级不一致。 | 按 models.dev DeepSeek V4 Flash/Pro 重新校准：CNY 用 1 CNY=0.15 USD，峰时 ×2；`deepseek-flash` 闲时 ¥0.0187/¥0.9333/¥1.8667，`v4-pro` 闲时 ¥0.0242/¥2.9/¥5.8（v1.5.0）。**v1.5.1 已回退，见 #23**。 |
 | 23 | **1.5.0 的"models.dev 校准"用了过期快照，导致全线低估** | 1.5.0 写入的 models.dev 值（input 0.14/0.435、output 0.28/0.87、cache read 0.0028/0.003625）是旧快照；2026-10-23 的 models.dev 已是 0.15/0.66、0.60/1.98、0.003/0.022（谷价 USD），官方输出价是 ¥8/¥27。实测当前会话 45 条高峰请求：网关逐笔实收 $0.127024，按官方 USD 表重算一分不差，而 1.5.0 只算 $0.082119（−35.4%）；今日卡片因费率 + 记录覆盖只到官方价的 39.7%。 | 1.5.1 回退为官方 CNY/USD 表（CNY flash 0.04/2/8、pro 0.3/9/27；USD flash 0.006/0.3/1.2、pro 0.044/1.32/3.96，谷价 = 峰价 ÷ 2），并修正面板费率来源文案；审计过程见 `BILLING-AUDIT.md`。 |
+| 24 | **缺少分时段汇总与每日费用查询** | Token 构成表按桶分行，用户需要自己把命中/未命中/输出相加才能得到忙时或闲时的总费用；Today 只给当天，无法回看最近 30 天每天的费用。 | 表下增加忙时/闲时汇总（输入命中、输入未命中、输出、费用）；Host 的按日账本从 8 天扩到 30 天，快照 v7 返回顶层 `history`，面板可展开近 30 天每日 token 与费用（v1.7.0）。 |
 
 ---
 
@@ -212,7 +213,7 @@ Browser 半侧：
 |---|---|
 | Host | 每个 `step/start` 按北京时间判断：周一至周五 09–12、14–18 为 `peak`，其余为 `off`；该步的 usage 落到对应桶（没有 step 时用 `assistant/message` 时间兜底）；episode/session 都累计 `periods.peak` / `periods.off` |
 | Record | 每个交互记录也带 `periods`，所以“每次交互”的费用可以按它自己的时段算，而不是按渲染时时段 |
-| Snapshot | `version: 6`；每个 session 行增加 `periods`、`periodsFrom`、`models`、`today` |
+| Snapshot | `version: 7`；每个 session 行增加 `periods`、`periodsFrom`、`models`、`today`；顶层增加 `history`（最近 30 天，跨会话合并） |
 | Client | 优先用 Host `periods`；Host 启动前的记录用 `endedAt` 时间回退；再没有时段就归入忙时；不存在 `partial` / “未分时段”状态 |
 
 峰/谷窗口按北京时间工作日 09–12、14–18；周末按低谷。`1.6.0` 起内置 2026 年法定节假日（国办发明电〔2025〕7号），节假日按低谷；2027 年及以后需要更新 `CN_HOLIDAYS_2026`，未建模的年份仍按高峰保守估算。
@@ -233,8 +234,9 @@ Browser 半侧：
 - **时段持久化（v1.4.7）**：Host 在每个 episode 结算后把 tokens / periods 写入 `<DSH_PROFILE_DIR>/storages/pet-whale/periods.json`，启动时恢复；DSH 重启后历史忙/闲桶不再清零。持久化只覆盖已结算 episode，进行中的回合按浏览器完整投影 + 当前时段处理。
 - **节假日表（v1.6.0）**：内置 2026 年国务院法定节假日（北京日期），`isPeakTime` 先查节假日表，命中即低谷；周末本就低谷。Host 与浏览器两端共用同一份日期，避免一边按峰、一边按谷。2027 年放假安排发布后需要补表。
 - **按实际模型计价（v1.6.0）**：Host 快照 v6 在 session / record 上增加 `models`（按 model id 存 peak/off 桶），每个 `assistant/message` 从 `message.source.model` 取真实模型。客户端 `priceModelLedger` 逐模型套费率；Host 升级前只有 `periods` 没有 `models` 的部分，以及浏览器投影多出来的历史 token，都归到当前下拉框选中的 fallback 模型（忙时优先），所以总数不会丢。混用 flash + pro 时不再把 pro 按 flash 计价。
-- **Today 按日账本（v1.6.0）**：Host 会话行增加 `today`（`date` + `tokens` + `periods` + `models`），每次 usage 按北京日期落入会话的 `days` 账本，持久化保留最近 8 天。面板优先汇总所有会话的 `today`，因此覆盖正在运行的回合和 Host 重启前的当天数据；老 Host 没有 `today` 时回退到 80 条记录。记录窗口不再是 Today 的上限。
-- **Host 快照 v6 / store v2**：新增 `models` / `today` 字段；`periods.json` 版本从 1 升到 2，读取时兼容 v1（缺失字段按空处理），不需要手工迁移。升级后需重启一次 DSH 才能让 Host 半侧生效。
+- **Today 按日账本（v1.6.0）**：Host 会话行增加 `today`（`date` + `tokens` + `periods` + `models`），每次 usage 按北京日期落入会话的 `days` 账本，持久化保留最近 30 天。面板优先汇总所有会话的 `today`，因此覆盖正在运行的回合和 Host 重启前的当天数据；老 Host 没有 `today` 时回退到 80 条记录。记录窗口不再是 Today 的上限。
+- **分时段汇总 + 近 30 天（v1.7.0）**：Token 构成表下方增加忙时/闲时各自汇总（输入命中、输入未命中、输出、费用）；Host 快照 v7 增加顶层 `history`，把各会话的 `days` 合并为最近 30 天，面板可展开查看每天 token 与费用。
+- **Host 快照 v6/v7 / store v2**：v6 新增 `models` / `today`，v7 新增 `history`；`periods.json` 版本从 1 升到 2，读取时兼容 v1（缺失字段按空处理），不需要手工迁移。升级后需重启一次 DSH 才能让 Host 半侧生效。
 
 Host 的 `periods` / `models` 只覆盖本插件进程启动后的请求；要让当前长会话的历史也精确，仍依赖 dsh-context 的完整 `contextTimeline.cost`。Host v6 需要重启一次 DSH 才会开始记录 `models` / `today`。`periods` 升级前的历史没有模型归属，客户端归到 fallback 模型（忙时优先）。
 

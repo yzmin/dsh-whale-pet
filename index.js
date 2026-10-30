@@ -81,6 +81,8 @@ const ASSET_TYPES = new Map([
  * loadable from a bare profile link, where only Node builtins resolve.
  */
 const MAX_RECORDS = 80;
+/** Keep a rolling month of per-day usage for the 30-day cost view. */
+const MAX_DAILY_DAYS = 30;
 /** Bounded pending-approval ledger; permissions are rare, so this is generous. */
 const MAX_APPROVALS = 20;
 
@@ -683,9 +685,9 @@ export function apply(ctx) {
     addUsage(day.tokens, usage);
     addUsage(day.periods[period], usage);
     addModelUsage(day.models, model, usage, period);
-    // Keep a week of days: enough for "today" across a restart, bounded memory.
+    // Keep a rolling month of days for the 30-day usage view.
     const keys = Object.keys(days).sort();
-    while (keys.length > 8) delete days[keys.shift()];
+    while (keys.length > MAX_DAILY_DAYS) delete days[keys.shift()];
   };
 
   /**
@@ -1044,6 +1046,8 @@ export function apply(ctx) {
     // lesson here — a throw in this loop turned the entire route into a bare 400
     // with no indication of which session or field was at fault.
     const sessions = [];
+    /** Union of every session's day ledger, for the 30-day view. */
+    const allDays = {};
     for (const [sessionId, entry] of sessionTotals) {
       try {
         if (!isSessionKey(sessionId) || entry === undefined || entry.tokens === undefined) continue;
@@ -1059,6 +1063,7 @@ export function apply(ctx) {
         if (live !== undefined && live.models !== undefined) mergeModels(models, live.models);
         const days = entry.days === undefined ? {} : cloneDays(entry.days);
         if (live !== undefined && live.days !== undefined) mergeDays(days, live.days);
+        mergeDays(allDays, days);
         const todayKey = beijingDayKey(now);
         const today = days[todayKey] === undefined ? emptyDay(todayKey) : cloneDay(days[todayKey]);
         const startedAt = entry.startedAt;
@@ -1101,14 +1106,20 @@ export function apply(ctx) {
     }
     approvalRows.sort((left, right) => right.askedAt - left.askedAt);
 
+    const history = Object.keys(allDays)
+      .sort()
+      .slice(-MAX_DAILY_DAYS)
+      .map((date) => cloneDay(allDays[date]));
+
     return {
-      version: 6,
+      version: 7,
       now,
       busy: active.length > 0,
       active,
       records: records.slice(0, MAX_RECORDS),
       feed: feed.slice(0, 20),
       sessions,
+      history,
       approvals: approvalRows,
       approvalCount: approvalRows.length,
       grandTotalTokens: sessions.reduce((sum, row) => sum + row.totalTokens, 0),
